@@ -64,8 +64,9 @@ export class TerminalChatView extends LitElement {
 
     .chat-input {
       flex: 1;
+      width: 100%;
       padding: 0.75rem 1.125rem;
-      background-color: rgb(45 50 55);
+      background-color: transparent;
       border: 1px solid rgb(60 65 70);
       border-radius: 1.5rem;
       color: #ffffff;
@@ -75,6 +76,8 @@ export class TerminalChatView extends LitElement {
       -webkit-user-select: text;
       user-select: text;
       opacity: 1;
+      position: relative;
+      z-index: 2;
     }
 
     .chat-input:focus {
@@ -86,6 +89,33 @@ export class TerminalChatView extends LitElement {
     .chat-input::placeholder {
       color: rgb(140 145 150);
       opacity: 1;
+    }
+
+    .chat-input-wrapper {
+      position: relative;
+      flex: 1;
+      display: flex;
+      align-items: center;
+    }
+
+    .chat-input-suggestion {
+      position: absolute;
+      left: 1.125rem;
+      right: 1.125rem;
+      top: 50%;
+      transform: translateY(-50%);
+      color: rgb(140 145 150 / 0.9);
+      pointer-events: none;
+      white-space: pre;
+      overflow: hidden;
+      text-overflow: clip;
+      font-size: 16px;
+      font-family: inherit;
+      z-index: 1;
+    }
+
+    .chat-input-suggestion-prefix {
+      visibility: hidden;
     }
 
     .send-button {
@@ -201,18 +231,25 @@ export class TerminalChatView extends LitElement {
     .message-bubble {
       padding: 0.875rem 1rem;
       border-radius: 1.125rem;
-      max-width: 88%;
+      max-width: 100%;
       word-wrap: break-word;
       font-size: 0.9rem;
       line-height: 1.5;
       position: relative;
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
     }
 
     .message-content {
       margin: 0;
-      white-space: pre-wrap;
-      word-break: break-word;
-      font-family: inherit;
+      white-space: pre;
+      word-break: normal;
+      overflow-wrap: normal;
+      font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+      font-variant-ligatures: none;
+      letter-spacing: 0;
+      tab-size: 8;
+      min-width: max-content;
     }
 
     /* Command messages (user) - align right, WhatsApp green style */
@@ -377,6 +414,8 @@ export class TerminalChatView extends LitElement {
   private syncInterval?: ReturnType<typeof setInterval>;
 
   @state() private messages: ChatMessage[] = [];
+  @state() private chatInputValue = '';
+  @state() private inputSuggestion = '';
 
   @query('#chat-input-field')
   private inputElement!: HTMLInputElement;
@@ -387,6 +426,7 @@ export class TerminalChatView extends LitElement {
   private messageIdCounter = 0;
   private outputLineBuffer = '';
   private carriageReturnPending = false;
+  private partialLineFlushTimer: ReturnType<typeof setTimeout> | undefined;
 
   connectedCallback() {
     super.connectedCallback();
@@ -403,6 +443,10 @@ export class TerminalChatView extends LitElement {
     if (this.outputUnsubscribe) {
       this.outputUnsubscribe();
       this.outputUnsubscribe = undefined;
+    }
+    if (this.partialLineFlushTimer) {
+      clearTimeout(this.partialLineFlushTimer);
+      this.partialLineFlushTimer = undefined;
     }
     // Stop sync interval
     this.stopTerminalSync();
@@ -446,20 +490,28 @@ export class TerminalChatView extends LitElement {
     }
     // Sync input when becoming active
     if (changedProperties.has('active')) {
+      if (this.partialLineFlushTimer) {
+        clearTimeout(this.partialLineFlushTimer);
+        this.partialLineFlushTimer = undefined;
+      }
+
       if (this.active) {
         // Entering chat mode: keep input state local and do not pull prompt-line text
         // from terminal. fish/repl redraws (autosuggestion/completion/progress) can
         // make prompt scraping unstable.
         this.outputLineBuffer = '';
         this.carriageReturnPending = false;
+        this.inputSuggestion = '';
 
         // Priority: pendingInput only
         if (this.pendingInput && this.inputElement) {
           // Fallback to pendingInput
           this.inputElement.value = this.pendingInput;
+          this.chatInputValue = this.pendingInput;
           this.lastSentValue = this.pendingInput;
         } else {
           // No input to sync, start fresh
+          this.chatInputValue = '';
           this.lastSentValue = '';
           if (this.inputElement) {
             this.inputElement.value = '';
@@ -480,6 +532,8 @@ export class TerminalChatView extends LitElement {
         this.lastSentValue = '';
         this.outputLineBuffer = '';
         this.carriageReturnPending = false;
+        this.chatInputValue = '';
+        this.inputSuggestion = '';
         if (this.inputElement) {
           this.inputElement.value = '';
         }
@@ -493,6 +547,10 @@ export class TerminalChatView extends LitElement {
   }
 
   private processTerminalOutput(data: string) {
+    if (!this.active) return;
+
+    this.updateSuggestionFromOutputChunk(data);
+
     // Keep CR/LF semantics and partial lines instead of naive split.
     // fish and readline frequently redraw the current line using \r without \n.
     const cleanData = this.stripAnsiCodes(data);
@@ -511,24 +569,35 @@ export class TerminalChatView extends LitElement {
     const flushLine = (rawLine: string) => {
       this.carriageReturnPending = false;
       const normalized = rawLine.replace(/\r+/g, '');
-      let trimmedLine = normalized.trim();
-      if (!trimmedLine) return;
+      let line = this.applyBackspaces(normalized);
+      if (!line.trim()) return;
 
       // Filter echo of executed command
-      if (lastCommand && (trimmedLine === lastCommand || trimmedLine.endsWith(lastCommand))) return;
+      if (lastCommand && (line === lastCommand || line.endsWith(lastCommand))) return;
 
-      // Filter live echo of current typing
-      const cleanContent = trimmedLine.replace(/^[\s│]*[>·$#]\s?/, '').replace(/[│\s]*$/, '');
-      if (currentInput && cleanContent && currentInput.startsWith(cleanContent)) return;
+      // Keep prompt/autocomplete lines visible in chat; only drop exact current input echo.
+      if (currentInput && line.trim() === currentInput) return;
 
       // Filter TUI noise (boxes, status bars, spinners)
-      if (this.isNoiseLine(trimmedLine)) return;
+      if (this.isNoiseLine(line)) return;
 
-      // Clean up leading symbols (spinners, prompts)
-      trimmedLine = trimmedLine.replace(/^[\s]*[·⏵>⏺✻✽✶✳✢✦⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s?/, '');
-      if (!trimmedLine.trim()) return;
+      // Clean up spinner-only prefixes but keep shell prompts like ❯, ➜, $ etc.
+      line = line.replace(/^[\s]*[·⏺✻✽✶✳✢✦⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]+\s?/, '');
+      if (!line.trim()) return;
 
-      this.appendOutputToChat(trimmedLine.trim());
+      this.appendOutputToChat(line);
+    };
+
+    const schedulePartialFlush = () => {
+      if (this.partialLineFlushTimer) {
+        clearTimeout(this.partialLineFlushTimer);
+      }
+      this.partialLineFlushTimer = setTimeout(() => {
+        if (!this.outputLineBuffer.trim()) return;
+        // Flush unfinished line so fish autosuggestions/completions become visible
+        // in chat mode even when shell redraw does not emit a newline.
+        flushLine(this.outputLineBuffer);
+      }, 40);
     };
 
     // Apply pending carriage-return redraw across chunk boundaries.
@@ -544,6 +613,7 @@ export class TerminalChatView extends LitElement {
 
       if (crIndex === -1 && lfIndex === -1) {
         this.outputLineBuffer += chunk;
+        schedulePartialFlush();
         break;
       }
 
@@ -571,11 +641,16 @@ export class TerminalChatView extends LitElement {
         // carriage-return redraw: replace current logical line and mark pending redraw
         this.carriageReturnPending = true;
         this.outputLineBuffer = head;
+        flushLine(this.outputLineBuffer);
       } else {
         // line completed (\n or \r\n)
         this.outputLineBuffer += head;
         flushLine(this.outputLineBuffer);
         this.outputLineBuffer = '';
+        if (this.partialLineFlushTimer) {
+          clearTimeout(this.partialLineFlushTimer);
+          this.partialLineFlushTimer = undefined;
+        }
       }
 
       chunk = chunk.slice(splitIndex + newlineLen);
@@ -586,9 +661,16 @@ export class TerminalChatView extends LitElement {
     // Box borders and horizontal lines
     if (line.match(/^[─_━\s╭╮╰╯│]+$/)) return true;
 
-    // Very short lines that are likely noise (single chars like ~, >, etc)
+    // Very short lines that are likely noise (single chars like ~, etc)
     const trimmed = line.trim();
-    if (trimmed.length <= 2 && !trimmed.match(/^[a-zA-Z0-9]$/)) return true;
+    if (
+      trimmed.length <= 2 &&
+      !trimmed.match(/^[a-zA-Z0-9]$/) &&
+      !trimmed.match(/^[><]$/) &&
+      !trimmed.match(/^[❯➜$#%]$/)
+    ) {
+      return true;
+    }
 
     // Thinking/processing indicators (Gemini, Claude CLI)
     if (
@@ -666,22 +748,17 @@ export class TerminalChatView extends LitElement {
     // If last message is from System (output), append to it
     if (lastMsg && lastMsg.type === 'output') {
       const lastLines = lastMsg.content.split('\n');
-      const lastLine = lastLines[lastLines.length - 1].trim();
+      const lastLine = lastLines[lastLines.length - 1] ?? '';
+      const trimmedLastLine = lastLine.trim();
 
       // Case 1: Exact duplicate - skip
       if (lastLine === content) {
         return;
       }
 
-      // Case 2: Content already exists in message - skip
-      if (lastMsg.content.includes(content)) {
-        return;
-      }
-
-      // Case 3: New content is a continuation of the last line (streaming/progressive reveal)
+      // Case 2: New content is a continuation of the last line (streaming/progressive reveal)
       // e.g., lastLine = "Hello", content = "Hello, how are you?"
       if (content.startsWith(lastLine) && lastLine.length > 0) {
-        // Replace last line with the longer version
         if (lastLines.length > 1) {
           lastLines[lastLines.length - 1] = content;
           lastMsg.content = lastLines.join('\n');
@@ -693,15 +770,17 @@ export class TerminalChatView extends LitElement {
         return;
       }
 
-      // Case 4: Last line is a prefix of the new content on a different part
-      // Check if any recent line starts the same as the new content
-      const recentLines = lastLines.slice(-5); // Check last 5 lines
-      for (let i = recentLines.length - 1; i >= 0; i--) {
-        const recentLine = recentLines[i].trim();
-        if (recentLine && content.startsWith(recentLine)) {
-          // This is a continuation of a recent line - likely a redraw, skip
-          return;
+      // Case 3: same text with only trailing spaces changed
+      if (trimmedLastLine && trimmedLastLine === content.trim()) {
+        if (lastLines.length > 1) {
+          lastLines[lastLines.length - 1] = content;
+          lastMsg.content = lastLines.join('\n');
+        } else {
+          lastMsg.content = content;
         }
+        this.requestUpdate();
+        this.scrollToBottom();
+        return;
       }
 
       // Normal case: append new content
@@ -773,14 +852,67 @@ export class TerminalChatView extends LitElement {
         continue;
       }
 
-      // Keep printable chars and CR/LF/TAB plus backspace for redraw semantics.
+      // Keep printable chars and CR/LF/TAB plus backspace and DEL for redraw semantics.
       const code = str.charCodeAt(i);
-      if (code === 0x08 || code === 0x0d || code === 0x0a || code === 0x09 || code >= 0x20) {
+      if (
+        code === 0x08 ||
+        code === 0x7f ||
+        code === 0x0d ||
+        code === 0x0a ||
+        code === 0x09 ||
+        code >= 0x20
+      ) {
         result += ch;
       }
     }
 
     return result;
+  }
+
+  private applyBackspaces(input: string): string {
+    let out = '';
+    for (let i = 0; i < input.length; i++) {
+      const ch = input[i];
+      if (ch === '\b' || ch.charCodeAt(0) === 0x7f) {
+        out = out.slice(0, -1);
+      } else {
+        out += ch;
+      }
+    }
+    return out;
+  }
+
+  private updateSuggestionFromOutputChunk(rawChunk: string): void {
+    const baseInput = this.chatInputValue;
+    if (!baseInput) {
+      this.inputSuggestion = '';
+      return;
+    }
+
+    const cleanChunk = this.stripAnsiCodes(rawChunk);
+    if (!cleanChunk) return;
+
+    const lines = cleanChunk.split(/\r?\n/).map((line) => this.applyBackspaces(line));
+
+    // Find the most plausible fish autosuggestion line that starts with current input.
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i].replace(/\r+/g, '').trimEnd();
+      if (!line) continue;
+      if (!line.startsWith(baseInput)) continue;
+      if (line === baseInput) continue;
+
+      // Remove obvious prompts before comparison
+      const withoutPrompt = line.replace(/^[\s]*[❯➜$#%>]+\s*/, '');
+      if (!withoutPrompt.startsWith(baseInput)) continue;
+
+      this.inputSuggestion = withoutPrompt;
+      return;
+    }
+
+    // Keep previous suggestion unless a hard mismatch is detected.
+    if (this.inputSuggestion && !this.inputSuggestion.startsWith(baseInput)) {
+      this.inputSuggestion = '';
+    }
   }
 
   private addMessage(type: ChatMessage['type'], content: string) {
@@ -1113,25 +1245,36 @@ export class TerminalChatView extends LitElement {
         </div>
         
         <!-- Chat input area (WhatsApp style) -->
-        <div 
+        <div
           class="chat-input-container"
           @click=${(e: Event) => e.stopPropagation()}
           @keydown=${(e: KeyboardEvent) => e.stopPropagation()}
         >
-          <input
-            id="chat-input-field"
-            type="text"
-            class="chat-input"
-            placeholder="Type a command..."
-            autocomplete="off"
-            autocorrect="off"
-            autocapitalize="off"
-            spellcheck="false"
-            @keydown=${this.handleInputKeydown}
-            @input=${this.handleInput}
-            @focus=${() => logger.log('Input focused')}
-            @blur=${() => logger.log('Input blurred')}
-          />
+          <div class="chat-input-wrapper">
+            ${
+              this.inputSuggestion && this.chatInputValue
+                ? html`
+                  <div class="chat-input-suggestion" aria-hidden="true">
+                    <span class="chat-input-suggestion-prefix">${this.chatInputValue}</span>${this.inputSuggestion.slice(this.chatInputValue.length)}
+                  </div>
+                `
+                : ''
+            }
+            <input
+              id="chat-input-field"
+              type="text"
+              class="chat-input"
+              placeholder="Type a command..."
+              autocomplete="off"
+              autocorrect="off"
+              autocapitalize="off"
+              spellcheck="false"
+              @keydown=${this.handleInputKeydown}
+              @input=${this.handleInput}
+              @focus=${() => logger.log('Input focused')}
+              @blur=${() => logger.log('Input blurred')}
+            />
+          </div>
           <button
             class="keyboard-dismiss-button"
             @click=${this.handleDismissKeyboard}
@@ -1177,6 +1320,11 @@ export class TerminalChatView extends LitElement {
     // Stop waiting for response when user starts typing a new command
 
     const newValue = input.value;
+    this.chatInputValue = newValue;
+
+    if (this.inputSuggestion && !this.inputSuggestion.startsWith(newValue)) {
+      this.inputSuggestion = '';
+    }
 
     // Update pending input for InputManager (for display sync)
     this.onPendingInputChange?.(newValue);
@@ -1244,6 +1392,8 @@ export class TerminalChatView extends LitElement {
 
     // Clear input directly on the DOM element
     input.value = '';
+    this.chatInputValue = '';
+    this.inputSuggestion = '';
     this.lastSentValue = '';
 
     // Clear pending input in InputManager

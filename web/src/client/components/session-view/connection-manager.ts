@@ -21,6 +21,7 @@ export class ConnectionManager {
   private outputBuffer = '';
   private batchTimeout: number | null = null;
   private onTerminalOutput: ((data: string) => void) | null = null;
+  private terminalQueryTail = '';
 
   constructor(
     private onSessionExit: (sessionId: string) => void,
@@ -68,6 +69,25 @@ export class ConnectionManager {
       this.batchTimeout = null;
     };
 
+    const DSR_RESPONSE = '\u001b[?1;2c';
+
+    const respondToPrimaryDeviceAttributeQuery = (chunk: string): void => {
+      // fish terminal-compatibility probes terminal capabilities with DA1 query (CSI c).
+      // Respond from client-side terminal shim to avoid fish warning/no-feature fallback.
+      const combined = `${this.terminalQueryTail}${chunk}`;
+      let searchFrom = 0;
+      while (searchFrom < combined.length) {
+        const queryIndex = combined.indexOf('\u001b[c', searchFrom);
+        if (queryIndex === -1) break;
+        if (this.session) {
+          terminalSocketClient.sendInputText(this.session.id, DSR_RESPONSE);
+        }
+        searchFrom = queryIndex + 3;
+      }
+
+      this.terminalQueryTail = combined.slice(-8);
+    };
+
     const enqueue = (chunk: string) => {
       this.outputBuffer += chunk;
       if (this.batchTimeout === null) {
@@ -80,6 +100,7 @@ export class ConnectionManager {
       events: true,
       onStdout: (bytes) => {
         const chunk = this.stdoutDecoder.decode(bytes, { stream: true });
+        respondToPrimaryDeviceAttributeQuery(chunk);
         if (this.onTerminalOutput) {
           this.onTerminalOutput(chunk);
         }
@@ -132,6 +153,7 @@ export class ConnectionManager {
       this.batchTimeout = null;
     }
     this.outputBuffer = '';
+    this.terminalQueryTail = '';
     this.unsubscribe?.();
     this.unsubscribe = null;
   }
