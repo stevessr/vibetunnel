@@ -334,6 +334,9 @@ export class SessionView extends LitElement {
       },
       updateShowQuickKeys: (value: boolean) => {
         this.uiStateManager.setShowQuickKeys(value);
+        if (!value) {
+          this.uiStateManager.setUseDirectKeyboard(false);
+        }
         this.requestUpdate();
         // Update terminal transform when quick keys visibility changes
         this.updateTerminalTransform();
@@ -712,50 +715,93 @@ export class SessionView extends LitElement {
   private toggleDirectKeyboard() {
     this.uiStateManager.toggleDirectKeyboard();
 
-    // If enabling direct keyboard on mobile, ensure hidden input
+    // If enabling direct keyboard on mobile, ensure hidden input and close visible input overlay
     const state = this.uiStateManager.getState();
     if (state.isMobile && state.useDirectKeyboard) {
+      this.uiStateManager.setShowMobileInput(false);
+      this.uiStateManager.setShowQuickKeys(true);
       this.directKeyboardManager.ensureHiddenInputVisible();
+    } else {
+      this.uiStateManager.setShowQuickKeys(false);
+      this.directKeyboardManager.blurHiddenInput();
     }
+
+    this.updateTerminalTransform();
   }
 
   private handleToggleChatMode() {
     const currentChatMode = this.uiStateManager.getState().chatMode;
     const enteringChatMode = !currentChatMode;
 
-    // If entering chat mode, blur the hidden input to release keyboard capture
-    // This allows the chat input to receive focus and keystrokes
     if (enteringChatMode) {
+      this.uiStateManager.hideAllMobileOverlays();
+      this.uiStateManager.setUseDirectKeyboard(false);
+      this.uiStateManager.setShowMobileInput(false);
+      this.directKeyboardManager.blurHiddenInput();
+    } else {
+      this.uiStateManager.hideAllMobileOverlays();
+      this.uiStateManager.setUseDirectKeyboard(false);
+      this.uiStateManager.setShowMobileInput(false);
       this.directKeyboardManager.blurHiddenInput();
     }
 
-    // Toggle the chat mode
     this.uiStateManager.toggleChatMode();
+    this.updateTerminalTransform();
   }
   private handleKeyboardButtonClick() {
-    // Show quick keys immediately for visual feedback
-    this.uiStateManager.setShowQuickKeys(true);
+    const state = this.uiStateManager.getState();
 
-    // Update terminal transform immediately
+    if (state.showMobileInput && !state.useDirectKeyboard) {
+      // Switch from visible mobile controls to direct keyboard mode
+      this.uiStateManager.setUseDirectKeyboard(true);
+      this.uiStateManager.setShowMobileInput(false);
+      this.uiStateManager.setShowQuickKeys(true);
+      this.directKeyboardManager.focusHiddenInput();
+    } else if (state.useDirectKeyboard && state.showQuickKeys) {
+      // Hide keyboard overlays and return to action bar
+      this.uiStateManager.hideAllMobileOverlays();
+      this.uiStateManager.setUseDirectKeyboard(false);
+      this.directKeyboardManager.blurHiddenInput();
+    } else {
+      // Open visible mobile controls first (tap-to-show keyboard controls)
+      this.uiStateManager.setShowMobileInput(true);
+      this.uiStateManager.setUseDirectKeyboard(false);
+      this.uiStateManager.setShowQuickKeys(false);
+      this.directKeyboardManager.blurHiddenInput();
+    }
+
     this.updateTerminalTransform();
-
-    // Focus the hidden input synchronously - critical for iOS Safari
-    // Must be called directly in the click handler without any delays
-    this.directKeyboardManager.focusHiddenInput();
-
-    // Request update after all synchronous operations
     this.requestUpdate();
   }
+
+  private handleMobileInputToggle = () => {
+    const state = this.uiStateManager.getState();
+    const nextVisible = !state.showMobileInput;
+
+    this.uiStateManager.setShowMobileInput(nextVisible);
+    if (nextVisible) {
+      this.uiStateManager.setUseDirectKeyboard(false);
+      this.uiStateManager.setShowQuickKeys(false);
+      this.directKeyboardManager.blurHiddenInput();
+    }
+
+    this.updateTerminalTransform();
+  };
 
   private handleTerminalClick(e: Event) {
     const uiState = this.uiStateManager.getState();
     if (uiState.isMobile) {
-      // Prevent the event from bubbling and default action
       e.stopPropagation();
       e.preventDefault();
 
-      // Don't do anything - the hidden input should handle all interactions
-      // The click on the terminal is actually a click on the hidden input overlay
+      // On mobile, tap-to-focus should always open direct keyboard mode when not in chat mode.
+      if (!uiState.chatMode) {
+        this.uiStateManager.setUseDirectKeyboard(true);
+        this.uiStateManager.setShowMobileInput(false);
+        this.uiStateManager.setShowQuickKeys(true);
+        this.updateTerminalTransform();
+        this.directKeyboardManager.focusHiddenInput();
+      }
       return;
     }
   }
@@ -793,6 +839,15 @@ export class SessionView extends LitElement {
     };
   }
 
+  private shouldShowMobileActionBar(state: ReturnType<UIStateManager['getState']>): boolean {
+    if (!state.isMobile) return false;
+    if (state.chatMode) return false;
+    if (state.showMobileInput) return false;
+    if (state.showCtrlAlpha) return false;
+    if (state.useDirectKeyboard && state.showQuickKeys) return false;
+    return true;
+  }
+
   private updateTerminalTransform(): void {
     // Clear any existing timeout to debounce calls
     if (this._updateTerminalTransformTimeout) {
@@ -815,11 +870,13 @@ export class SessionView extends LitElement {
     // Used by quick keys and terminal spacing
     this.style.setProperty('--keyboard-height', `${Math.max(0, state.keyboardHeight)}px`);
 
-    const actionBarOffset = state.isMobile ? 90 : 0;
+    const showActionBar = this.shouldShowMobileActionBar(state);
+    const actionBarOffset = showActionBar ? 90 : 0;
+    const visibleInputOffset = state.isMobile && state.showMobileInput ? 180 : 0;
     const mobileBottomOffset = state.showQuickKeys
       ? totalBottomOffset
       : state.isMobile
-        ? actionBarOffset
+        ? Math.max(actionBarOffset, visibleInputOffset)
         : 0;
     this.style.setProperty('--mobile-bottom-offset', `${Math.max(0, mobileBottomOffset)}px`);
 
@@ -1062,7 +1119,12 @@ export class SessionView extends LitElement {
   }
 
   private handleHideKeyboard() {
-    this.uiStateManager.setShowQuickKeys(false);
+    this.uiStateManager.hideAllMobileOverlays();
+    this.uiStateManager.setUseDirectKeyboard(false);
+    this.uiStateManager.setShowMobileInput(false);
+    this.directKeyboardManager.blurHiddenInput();
+    this.updateTerminalTransform();
+    this.requestUpdate();
   }
 
   private async handleSendInput(text: string) {
@@ -1294,7 +1356,7 @@ export class SessionView extends LitElement {
         <div
           class="session-view-grid"
           style="outline: none !important; box-shadow: none !important; --keyboard-height: ${uiState.keyboardHeight}px; --quickkeys-height: 0px; --mobile-bottom-offset: 0px;"
-          data-keyboard-visible="${uiState.keyboardHeight > 0 || uiState.showQuickKeys ? 'true' : 'false'}"
+          data-keyboard-visible="${uiState.keyboardHeight > 0 || uiState.showQuickKeys || uiState.showMobileInput ? 'true' : 'false'}"
         >
         <!-- Session Header Area -->
         <div class="session-header-area">
@@ -1404,7 +1466,7 @@ export class SessionView extends LitElement {
                   .terminalFontSize=${uiState.terminalFontSize}
                   .terminalMaxCols=${uiState.terminalMaxCols}
                   .terminalTheme=${uiState.terminalTheme}
-                  .disableClick=${uiState.isMobile && uiState.useDirectKeyboard}
+                  .disableClick=${uiState.isMobile}
                   .hideScrollButton=${uiState.showQuickKeys}
                   .isMobile=${uiState.isMobile}
                   .showQuickKeys=${uiState.showQuickKeys}
@@ -1423,7 +1485,6 @@ export class SessionView extends LitElement {
                   .onSend=${(data: string) => this.inputManager?.sendInputText(data)}
                   .onPendingInputChange=${(input: string) => this.inputManager?.setPendingInput(input)}
                   .subscribeToOutput=${(listener: (data: string) => void) => this.subscribeToTerminalOutput(listener)}
-                  .getTerminalInputLine=${() => this.terminalLifecycleManager.getTerminal()?.getCurrentInputLine() ?? ''}
                 ></terminal-chat-view>
               </div>
             `
@@ -1436,7 +1497,7 @@ export class SessionView extends LitElement {
           uiState.isMobile
             ? html`
           <mobile-action-bar
-            .visible=${true}
+            .visible=${this.shouldShowMobileActionBar(uiState)}
             .session=${this.session}
             .keyboardVisible=${uiState.keyboardHeight > 0}
             .keyboardHeight=${uiState.keyboardHeight}
@@ -1553,7 +1614,7 @@ export class SessionView extends LitElement {
 
       <!-- Mobile Input Controls (only show when direct keyboard is disabled) -->
       ${
-        uiState.isMobile && !uiState.showMobileInput && !uiState.useDirectKeyboard
+        uiState.isMobile && uiState.showMobileInput && !uiState.useDirectKeyboard
           ? html`
             <div class="p-4 bg-bg-secondary" style="position: fixed; bottom: 0; left: 0; right: 0; z-index: ${Z_INDEX.TERMINAL_QUICK_KEYS};">
             <!-- First row: Arrow keys -->
@@ -1602,7 +1663,7 @@ export class SessionView extends LitElement {
                 class="flex-1 font-mono px-3 py-2 text-sm transition-all cursor-pointer quick-start-btn"
                 @click=${this.handleMobileInputToggle}
               >
-                ABC123
+                Hide
               </button>
               <button
                 class="font-mono text-sm transition-all cursor-pointer w-16 quick-start-btn"

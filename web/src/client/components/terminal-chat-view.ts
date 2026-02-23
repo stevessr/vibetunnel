@@ -370,7 +370,6 @@ export class TerminalChatView extends LitElement {
   @property() onSend?: (data: string) => void;
   @property() onPendingInputChange?: (input: string) => void;
   @property() subscribeToOutput?: (listener: (data: string) => void) => () => void;
-  @property() getTerminalInputLine?: () => string;
   @property({ type: Boolean }) active = false;
   @property({ type: String }) pendingInput = '';
   @property({ type: String }) sessionId = '';
@@ -386,6 +385,8 @@ export class TerminalChatView extends LitElement {
   private messagesContainer!: HTMLElement;
 
   private messageIdCounter = 0;
+  private outputLineBuffer = '';
+  private carriageReturnPending = false;
 
   connectedCallback() {
     super.connectedCallback();
@@ -428,48 +429,6 @@ export class TerminalChatView extends LitElement {
     }
   }
 
-  /**
-   * Disabled by design (see startTerminalSync comment).
-   */
-  private syncLastSentValueFromTerminal(): void {
-    // no-op
-  }
-
-  /**
-   * Sync input from terminal with retry - gives time for buffer to fully load
-   */
-  private syncFromTerminalWithRetry(attempt = 0): void {
-    if (!this.getTerminalInputLine) return;
-
-    let terminalInput = this.getTerminalInputLine();
-
-    if (terminalInput) {
-      // Aggressively clean up TUI artifacts and special characters
-      // biome-ignore lint/complexity/useRegexLiterals: Avoiding control character lint errors
-      const ctrlPattern = new RegExp('[\\x00-\\x1F\\x7F]', 'g');
-      terminalInput = terminalInput
-        .replace(ctrlPattern, '') // Remove control characters
-        .replace(/[│┃┆┇┊┋|]/g, ' ') // Replace box-drawing pipes with space
-        .replace(/[─━┄┅┈┉═]/g, '') // Remove horizontal lines
-        .replace(/[╭╮╰╯┌┐└┘]/g, '') // Remove corners
-        .replace(/\s+/g, ' ') // Collapse multiple spaces to one
-        .trim();
-
-      if (terminalInput) {
-        // Set input value directly on DOM element (not via reactive binding)
-        if (this.inputElement) {
-          this.inputElement.value = terminalInput;
-        }
-        return;
-      }
-    }
-
-    if (attempt < 3) {
-      // Retry after a short delay (buffer might still be loading)
-      setTimeout(() => this.syncFromTerminalWithRetry(attempt + 1), 150);
-    }
-  }
-
   updated(changedProperties: Map<string, unknown>) {
     super.updated(changedProperties);
     if (changedProperties.has('messages')) {
@@ -488,18 +447,14 @@ export class TerminalChatView extends LitElement {
     // Sync input when becoming active
     if (changedProperties.has('active')) {
       if (this.active) {
-        // Reset waiting state when entering chat mode
+        // Entering chat mode: keep input state local and do not pull prompt-line text
+        // from terminal. fish/repl redraws (autosuggestion/completion/progress) can
+        // make prompt scraping unstable.
+        this.outputLineBuffer = '';
+        this.carriageReturnPending = false;
 
-        // Priority: terminal buffer > pendingInput
-        if (this.getTerminalInputLine) {
-          // Read from terminal buffer - it has the "truth" of what's on screen
-          this.lastSentValue = '';
-          if (this.inputElement) {
-            this.inputElement.value = '';
-          }
-          this.syncFromTerminalWithRetry();
-          this.syncLastSentValueFromTerminal();
-        } else if (this.pendingInput && this.inputElement) {
+        // Priority: pendingInput only
+        if (this.pendingInput && this.inputElement) {
           // Fallback to pendingInput
           this.inputElement.value = this.pendingInput;
           this.lastSentValue = this.pendingInput;
@@ -511,7 +466,7 @@ export class TerminalChatView extends LitElement {
           }
         }
 
-        // Start periodic sync to keep lastSentValue in sync with terminal
+        // Keep sync disabled (see startTerminalSync)
         this.startTerminalSync();
 
         // Focus the input field when chat becomes active - with delay to ensure DOM is ready
@@ -522,12 +477,12 @@ export class TerminalChatView extends LitElement {
           }
         }, 100);
       } else {
-        // Reset waiting state when leaving chat mode
         this.lastSentValue = '';
+        this.outputLineBuffer = '';
+        this.carriageReturnPending = false;
         if (this.inputElement) {
           this.inputElement.value = '';
         }
-        // Stop sync when leaving chat mode
         this.stopTerminalSync();
       }
     }
@@ -538,16 +493,10 @@ export class TerminalChatView extends LitElement {
   }
 
   private processTerminalOutput(data: string) {
-    // Strip ANSI codes
+    // Keep CR/LF semantics and partial lines instead of naive split.
+    // fish and readline frequently redraw the current line using \r without \n.
     const cleanData = this.stripAnsiCodes(data);
-
-    // Ignore empty data
-    if (!cleanData.trim() && !cleanData.includes('\r') && !cleanData.includes('\n')) {
-      return;
-    }
-
-    // Split by lines to process each one
-    const lines = cleanData.split(/\r?\n/);
+    if (!cleanData) return;
 
     // Get the last command sent to filter out its echo
     const lastCommandMsg = this.messages
@@ -559,38 +508,77 @@ export class TerminalChatView extends LitElement {
     // Get current input value to filter out live echo
     const currentInput = this.inputElement?.value.trim() || '';
 
-    for (const line of lines) {
-      let trimmedLine = line.trim();
-
-      // 1. Filter out noise (separators, spinners, system prompts)
-      if (!trimmedLine) continue;
+    const flushLine = (rawLine: string) => {
+      this.carriageReturnPending = false;
+      const normalized = rawLine.replace(/\r+/g, '');
+      let trimmedLine = normalized.trim();
+      if (!trimmedLine) return;
 
       // Filter echo of executed command
-      if (lastCommand && (trimmedLine === lastCommand || trimmedLine.endsWith(lastCommand)))
-        continue;
+      if (lastCommand && (trimmedLine === lastCommand || trimmedLine.endsWith(lastCommand))) return;
 
       // Filter live echo of current typing
-      // We strip common prompt chars and box borders to check if the content matches what we are typing
-      const cleanContent = trimmedLine
-        .replace(/^[\s│]*[>·$#]\s?/, '') // Remove leading prompt/box
-        .replace(/[│\s]*$/, ''); // Remove trailing box/space
-
-      if (currentInput && cleanContent && currentInput.startsWith(cleanContent)) {
-        continue;
-      }
+      const cleanContent = trimmedLine.replace(/^[\s│]*[>·$#]\s?/, '').replace(/[│\s]*$/, '');
+      if (currentInput && cleanContent && currentInput.startsWith(cleanContent)) return;
 
       // Filter TUI noise (boxes, status bars, spinners)
-      if (this.isNoiseLine(trimmedLine)) continue;
+      if (this.isNoiseLine(trimmedLine)) return;
 
       // Clean up leading symbols (spinners, prompts)
-      // Includes braille patterns for spinners and various bullets
       trimmedLine = trimmedLine.replace(/^[\s]*[·⏵>⏺✻✽✶✳✢✦⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s?/, '');
+      if (!trimmedLine.trim()) return;
 
-      // If line became empty after cleaning, skip
-      if (!trimmedLine.trim()) continue;
-
-      // 2. Append to current message or create new one
       this.appendOutputToChat(trimmedLine.trim());
+    };
+
+    // Apply pending carriage-return redraw across chunk boundaries.
+    if (this.carriageReturnPending) {
+      this.outputLineBuffer = '';
+      this.carriageReturnPending = false;
+    }
+
+    let chunk = cleanData;
+    while (chunk.length > 0) {
+      const crIndex = chunk.indexOf('\r');
+      const lfIndex = chunk.indexOf('\n');
+
+      if (crIndex === -1 && lfIndex === -1) {
+        this.outputLineBuffer += chunk;
+        break;
+      }
+
+      let splitIndex: number;
+      let newlineLen = 1;
+
+      if (crIndex === -1) {
+        splitIndex = lfIndex;
+      } else if (lfIndex === -1) {
+        splitIndex = crIndex;
+        if (chunk[crIndex + 1] === '\n') {
+          newlineLen = 2;
+        }
+      } else {
+        splitIndex = Math.min(crIndex, lfIndex);
+        if (splitIndex === crIndex && chunk[crIndex + 1] === '\n') {
+          newlineLen = 2;
+        }
+      }
+
+      const head = chunk.slice(0, splitIndex);
+      const nl = chunk.slice(splitIndex, splitIndex + newlineLen);
+
+      if (nl.startsWith('\r') && !nl.includes('\n')) {
+        // carriage-return redraw: replace current logical line and mark pending redraw
+        this.carriageReturnPending = true;
+        this.outputLineBuffer = head;
+      } else {
+        // line completed (\n or \r\n)
+        this.outputLineBuffer += head;
+        flushLine(this.outputLineBuffer);
+        this.outputLineBuffer = '';
+      }
+
+      chunk = chunk.slice(splitIndex + newlineLen);
     }
   }
 
@@ -664,10 +652,8 @@ export class TerminalChatView extends LitElement {
 
     // Boxed content (lines starting and ending with │) that looks like noise
     if (line.startsWith('│') && line.endsWith('│')) {
-      // Assume it's a TUI box if it's short or matches known patterns
-      // (We already caught specific messages above, but this catches generic boxes)
-      // To be safe, we only filter if it contains "update" or "Homebrew" which we already did.
-      // Let's filter empty box lines
+      // Keep non-empty boxed content because fish/repl UIs may render meaningful
+      // completion rows within box borders.
       if (line.replace(/[│\s]/g, '').length === 0) return true;
     }
 
@@ -729,20 +715,72 @@ export class TerminalChatView extends LitElement {
   }
 
   private stripAnsiCodes(str: string): string {
-    // Remove ANSI escape codes but preserve the text
-    // biome-ignore lint/complexity/useRegexLiterals: Avoiding control character lint errors
-    const colorCodes = new RegExp('\\x1b\\[[0-9;]*m', 'g');
-    // biome-ignore lint/complexity/useRegexLiterals: Avoiding control character lint errors
-    const escapeSeq = new RegExp('\\x1b\\[.*?[@-~]', 'g');
-    // biome-ignore lint/complexity/useRegexLiterals: Avoiding control character lint errors
-    const oscSeq = new RegExp('\\x1b\\].*?\\x07', 'g');
-    // biome-ignore lint/complexity/useRegexLiterals: Avoiding control character lint errors
-    const otherSeq = new RegExp('\\x1b.*?[\\x40-\\x5a\\x5c\\x5f]', 'g');
-    return str
-      .replace(colorCodes, '')
-      .replace(escapeSeq, '')
-      .replace(oscSeq, '')
-      .replace(otherSeq, '');
+    // Remove ANSI/VT control sequences but keep CR/LF so line-rewrite semantics remain.
+    // This parser handles CSI/OSC/DCS/APC/PM/SOS/SS3 sequences used by modern shells.
+    let result = '';
+
+    for (let i = 0; i < str.length; i++) {
+      const ch = str[i];
+
+      // ESC-prefixed sequence
+      if (ch === '\u001b') {
+        const next = str[i + 1];
+        if (!next) continue;
+
+        // CSI: ESC [ ... final-byte(0x40-0x7E)
+        if (next === '[') {
+          i += 2;
+          while (i < str.length) {
+            const code = str.charCodeAt(i);
+            if (code >= 0x40 && code <= 0x7e) break;
+            i++;
+          }
+          continue;
+        }
+
+        // OSC/APC/PM/SOS/DCS-like string sequences terminated by BEL or ST (ESC \)
+        if (next === ']' || next === '^' || next === '_' || next === 'P' || next === 'X') {
+          i += 2;
+          while (i < str.length) {
+            if (str.charCodeAt(i) === 0x07) {
+              // BEL
+              break;
+            }
+            if (str[i] === '\u001b' && str[i + 1] === '\\') {
+              // ST
+              i += 1;
+              break;
+            }
+            i++;
+          }
+          continue;
+        }
+
+        // SS3 and other short ESC 2-byte/3-byte controls
+        // Skip ESC and following byte.
+        i += 1;
+        continue;
+      }
+
+      // C1 CSI (single-byte 0x9B) can appear in some streams
+      if (str.charCodeAt(i) === 0x9b) {
+        i += 1;
+        while (i < str.length) {
+          const code = str.charCodeAt(i);
+          if (code >= 0x40 && code <= 0x7e) break;
+          i++;
+        }
+        continue;
+      }
+
+      // Keep printable chars and CR/LF/TAB plus backspace for redraw semantics.
+      const code = str.charCodeAt(i);
+      if (code === 0x08 || code === 0x0d || code === 0x0a || code === 0x09 || code >= 0x20) {
+        result += ch;
+      }
+    }
+
+    return result;
   }
 
   private addMessage(type: ChatMessage['type'], content: string) {

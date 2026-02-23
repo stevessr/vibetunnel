@@ -21,6 +21,8 @@ export interface UIState {
   isLandscape: boolean;
   showQuickKeys: boolean;
   keyboardHeight: number;
+  useDirectKeyboard: boolean;
+  showMobileInput: boolean;
 
   // Touch tracking
   touchStartX: number;
@@ -72,6 +74,8 @@ export class UIStateManager {
     isLandscape: false,
     showQuickKeys: false,
     keyboardHeight: 0,
+    useDirectKeyboard: true,
+    showMobileInput: false,
 
     // Touch tracking
     touchStartX: 0,
@@ -149,6 +153,31 @@ export class UIStateManager {
   setKeyboardHeight(height: number): void {
     this.state.keyboardHeight = height;
     this.callbacks?.requestUpdate();
+  }
+
+  setUseDirectKeyboard(enabled: boolean): void {
+    this.state.useDirectKeyboard = enabled;
+    if (enabled) {
+      this.state.showMobileInput = false;
+    }
+    this.callbacks?.requestUpdate();
+  }
+
+  toggleDirectKeyboard(): void {
+    this.setUseDirectKeyboard(!this.state.useDirectKeyboard);
+  }
+
+  setShowMobileInput(show: boolean): void {
+    this.state.showMobileInput = show;
+    if (show) {
+      this.state.useDirectKeyboard = false;
+      this.state.showQuickKeys = false;
+    }
+    this.callbacks?.requestUpdate();
+  }
+
+  toggleMobileInput(): void {
+    this.setShowMobileInput(!this.state.showMobileInput);
   }
 
   // Touch tracking
@@ -267,7 +296,7 @@ export class UIStateManager {
         this.state.useDirectKeyboard = true; // Default to true when no settings exist
       }
     } catch (error) {
-      logger.error('Failed to load app preferences', error);
+      console.error('Failed to load app preferences', error);
       this.state.useDirectKeyboard = true; // Default to true on error
     }
   }
@@ -289,6 +318,12 @@ export class UIStateManager {
     if (enteringChatMode) {
       this.state.showQuickKeys = false;
     }
+    this.callbacks?.requestUpdate();
+  }
+
+  hideAllMobileOverlays(): void {
+    this.state.showQuickKeys = false;
+    this.state.showMobileInput = false;
     this.callbacks?.requestUpdate();
   }
 }

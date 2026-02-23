@@ -133,6 +133,10 @@ export class Terminal extends LitElement {
       this.requestResize('property-change');
     }
 
+    if (changed.has('disableClick') && this.disableClick) {
+      this.pasteInput?.blur();
+    }
+
     if (changed.has('theme')) {
       this.applyTheme();
     }
