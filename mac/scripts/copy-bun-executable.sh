@@ -35,16 +35,21 @@ if [ ! -d "$NATIVE_DIR" ]; then
     exit 0
 fi
 
-# Check if executable exists
-if [ ! -f "$NATIVE_DIR/vibetunnel" ]; then
-    echo -e "${YELLOW}Warning: Executable not found at $NATIVE_DIR/vibetunnel${NC}"
+# Prefer Rust server executable if present, otherwise fallback to vibetunnel
+SERVER_BINARY=""
+if [ -f "$NATIVE_DIR/vibetunnel-rs" ]; then
+    SERVER_BINARY="vibetunnel-rs"
+elif [ -f "$NATIVE_DIR/vibetunnel" ]; then
+    SERVER_BINARY="vibetunnel"
+else
+    echo -e "${YELLOW}Warning: No server executable found at $NATIVE_DIR (expected vibetunnel-rs or vibetunnel)${NC}"
     exit 0
 fi
 
-# Copy executable
-echo "Copying executable..."
-cp "$NATIVE_DIR/vibetunnel" "$DEST_RESOURCES/"
-chmod +x "$DEST_RESOURCES/vibetunnel"
+# Copy selected executable
+echo "Copying executable: $SERVER_BINARY"
+cp "$NATIVE_DIR/$SERVER_BINARY" "$DEST_RESOURCES/"
+chmod +x "$DEST_RESOURCES/$SERVER_BINARY"
 
 # Copy native modules
 if [ -f "$NATIVE_DIR/pty.node" ]; then
@@ -62,4 +67,4 @@ echo -e "${GREEN}✓ Executable and native modules copied successfully${NC}"
 
 # Verify the files
 echo "Verifying copied files:"
-ls -la "$DEST_RESOURCES/vibetunnel" "$DEST_RESOURCES/pty.node" "$DEST_RESOURCES/spawn-helper" 2>/dev/null || true
+ls -la "$DEST_RESOURCES/vibetunnel-rs" "$DEST_RESOURCES/vibetunnel" "$DEST_RESOURCES/pty.node" "$DEST_RESOURCES/spawn-helper" 2>/dev/null || true

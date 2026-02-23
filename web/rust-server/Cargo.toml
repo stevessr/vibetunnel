@@ -1,0 +1,24 @@
+[package]
+name = "vibetunnel-rs"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "vibetunnel_rs"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.8", features = ["ws"] }
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+futures = "0.3"
+uuid = { version = "1", features = ["v4"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["compression-full", "trace", "fs", "set-header"] }
+
+[dev-dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

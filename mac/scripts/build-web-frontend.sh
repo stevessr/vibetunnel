@@ -27,7 +27,7 @@ fi
 APP_RESOURCES="${BUILT_PRODUCTS_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}"
 
 # In CI with pre-built artifacts, skip the entire build process
-if [ "${CI}" = "true" ] && [ -f "${WEB_DIR}/dist/server/server.js" ]; then
+if [ "${CI}" = "true" ] && ( [ -f "${WEB_DIR}/dist/server/server.js" ] || [ -f "${WEB_DIR}/native/vibetunnel-rs" ] ); then
     echo "✓ CI environment detected with pre-built web artifacts"
     echo "✓ Skipping web frontend build entirely"
     
@@ -45,8 +45,12 @@ if [ "${CI}" = "true" ] && [ -f "${WEB_DIR}/dist/server/server.js" ]; then
     
     # Copy native executable and modules to app bundle if they exist
     NATIVE_DIR="${WEB_DIR}/native"
-    
-    if [ -f "${NATIVE_DIR}/vibetunnel" ]; then
+
+    if [ -f "${NATIVE_DIR}/vibetunnel-rs" ]; then
+        echo "Copying Rust server executable to app bundle..."
+        cp "${NATIVE_DIR}/vibetunnel-rs" "${APP_RESOURCES}/"
+        chmod +x "${APP_RESOURCES}/vibetunnel-rs"
+    elif [ -f "${NATIVE_DIR}/vibetunnel" ]; then
         echo "Copying native executable to app bundle..."
         cp "${NATIVE_DIR}/vibetunnel" "${APP_RESOURCES}/"
         chmod +x "${APP_RESOURCES}/vibetunnel"
@@ -101,7 +105,7 @@ if [ -f "${PREVIOUS_HASH_FILE}" ]; then
     PREVIOUS_HASH=$(cat "${PREVIOUS_HASH_FILE}")
     if [ "${CURRENT_HASH}" = "${PREVIOUS_HASH}" ]; then
         # Also check if the built files actually exist
-        if [ -d "${DEST_DIR}" ] && [ -f "${APP_RESOURCES}/vibetunnel" ] && [ -f "${APP_RESOURCES}/pty.node" ] && [ -f "${APP_RESOURCES}/spawn-helper" ] && [ -f "${APP_RESOURCES}/vibetunnel-fwd" ]; then
+        if [ -d "${DEST_DIR}" ] && ( [ -f "${APP_RESOURCES}/vibetunnel-rs" ] || [ -f "${APP_RESOURCES}/vibetunnel" ] ) && [ -f "${APP_RESOURCES}/pty.node" ] && [ -f "${APP_RESOURCES}/spawn-helper" ] && [ -f "${APP_RESOURCES}/vibetunnel-fwd" ]; then
             echo "Web content unchanged and build outputs exist. Skipping rebuild."
             NEED_REBUILD=0
         else
@@ -318,14 +322,20 @@ cp -R "${PUBLIC_DIR}/"* "${DEST_DIR}/"
 # Copy native executable and modules to app bundle
 NATIVE_DIR="${WEB_DIR}/native"
 
-if [ -f "${NATIVE_DIR}/vibetunnel" ]; then
+if [ -f "${NATIVE_DIR}/vibetunnel-rs" ]; then
+    echo "Copying Rust server executable to app bundle..."
+    EXEC_SIZE=$(ls -lh "${NATIVE_DIR}/vibetunnel-rs" | awk '{print $5}')
+    echo "  Executable size: $EXEC_SIZE"
+    cp "${NATIVE_DIR}/vibetunnel-rs" "${APP_RESOURCES}/"
+    chmod +x "${APP_RESOURCES}/vibetunnel-rs"
+elif [ -f "${NATIVE_DIR}/vibetunnel" ]; then
     echo "Copying native executable to app bundle..."
     EXEC_SIZE=$(ls -lh "${NATIVE_DIR}/vibetunnel" | awk '{print $5}')
     echo "  Executable size: $EXEC_SIZE"
     cp "${NATIVE_DIR}/vibetunnel" "${APP_RESOURCES}/"
     chmod +x "${APP_RESOURCES}/vibetunnel"
 else
-    echo "error: Native executable not found at ${NATIVE_DIR}/vibetunnel"
+    echo "error: Native executable not found at ${NATIVE_DIR}/vibetunnel-rs or ${NATIVE_DIR}/vibetunnel"
     exit 1
 fi
 
@@ -380,9 +390,9 @@ echo "Performing final sanity check..."
 
 MISSING_FILES=()
 
-# Check for vibetunnel executable
-if [ ! -f "${APP_RESOURCES}/vibetunnel" ]; then
-    MISSING_FILES+=("vibetunnel executable")
+# Check for server executable (prefer vibetunnel-rs, fallback vibetunnel)
+if [ ! -f "${APP_RESOURCES}/vibetunnel-rs" ] && [ ! -f "${APP_RESOURCES}/vibetunnel" ]; then
+    MISSING_FILES+=("server executable (vibetunnel-rs or vibetunnel)")
 fi
 
 # Check for pty.node
@@ -400,7 +410,10 @@ if [ ! -f "${APP_RESOURCES}/vibetunnel-fwd" ]; then
     MISSING_FILES+=("vibetunnel-fwd")
 fi
 
-# Check if vibetunnel is executable
+# Check if selected server executable is executable
+if [ -f "${APP_RESOURCES}/vibetunnel-rs" ] && [ ! -x "${APP_RESOURCES}/vibetunnel-rs" ]; then
+    MISSING_FILES+=("vibetunnel-rs is not executable")
+fi
 if [ -f "${APP_RESOURCES}/vibetunnel" ] && [ ! -x "${APP_RESOURCES}/vibetunnel" ]; then
     MISSING_FILES+=("vibetunnel is not executable")
 fi
@@ -434,23 +447,31 @@ if [ ${#MISSING_FILES[@]} -gt 0 ]; then
     echo "Build artifacts in ${NATIVE_DIR}:"
     ls -la "${NATIVE_DIR}" || echo "  Directory does not exist"
     echo "App resources in ${APP_RESOURCES}:"
-    ls -la "${APP_RESOURCES}/vibetunnel" "${APP_RESOURCES}/pty.node" "${APP_RESOURCES}/spawn-helper" "${APP_RESOURCES}/vt" 2>/dev/null || true
+    ls -la "${APP_RESOURCES}/vibetunnel-rs" "${APP_RESOURCES}/vibetunnel" "${APP_RESOURCES}/pty.node" "${APP_RESOURCES}/spawn-helper" "${APP_RESOURCES}/vt" 2>/dev/null || true
     exit 1
 fi
 
 # Verify the executable works
-echo "Verifying vibetunnel executable..."
-echo "Full path: ${APP_RESOURCES}/vibetunnel"
-if "${APP_RESOURCES}/vibetunnel" version &>/dev/null; then
-    VERSION_OUTPUT=$("${APP_RESOURCES}/vibetunnel" version 2>&1 | head -1)
-    echo "✓ VibeTunnel executable verified: $VERSION_OUTPUT"
+SERVER_EXEC=""
+if [ -x "${APP_RESOURCES}/vibetunnel-rs" ]; then
+    SERVER_EXEC="${APP_RESOURCES}/vibetunnel-rs"
+elif [ -x "${APP_RESOURCES}/vibetunnel" ]; then
+    SERVER_EXEC="${APP_RESOURCES}/vibetunnel"
+fi
+
+echo "Verifying server executable..."
+echo "Full path: ${SERVER_EXEC}"
+if [ -n "${SERVER_EXEC}" ] && "${SERVER_EXEC}" version &>/dev/null; then
+    VERSION_OUTPUT=$("${SERVER_EXEC}" version 2>&1 | head -1)
+    echo "✓ Server executable verified: $VERSION_OUTPUT"
 else
-    echo "error: VibeTunnel executable failed verification (version command failed)"
-    echo "Full executable path: ${APP_RESOURCES}/vibetunnel"
-    echo "Checking if file exists and is executable:"
-    ls -la "${APP_RESOURCES}/vibetunnel" || echo "File not found!"
-    echo "Attempting to run with error output:"
-    "${APP_RESOURCES}/vibetunnel" version 2>&1 || true
+    echo "error: Server executable failed verification (version command failed)"
+    echo "Checking available files:"
+    ls -la "${APP_RESOURCES}/vibetunnel-rs" "${APP_RESOURCES}/vibetunnel" 2>/dev/null || true
+    if [ -n "${SERVER_EXEC}" ]; then
+        echo "Attempting to run with error output:"
+        "${SERVER_EXEC}" version 2>&1 || true
+    fi
     exit 1
 fi
 

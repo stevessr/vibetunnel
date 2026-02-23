@@ -42,7 +42,7 @@ if [[ "$OSTYPE" == "darwin"* ]]; then
     if [ -n "$VIBETUNNEL_PREFER_DERIVED_DATA" ]; then
         # When preference is set, try DerivedData first
         for CANDIDATE in $(find ~/Library/Developer/Xcode/DerivedData -name "VibeTunnel.app" -type d 2>/dev/null | grep -v "\.dSYM" | grep -v "Index\.noindex" | sort -r); do
-            if [ -f "$CANDIDATE/Contents/Resources/vibetunnel" ]; then
+            if [ -f "$CANDIDATE/Contents/Resources/vibetunnel-rs" ] || [ -f "$CANDIDATE/Contents/Resources/vibetunnel" ]; then
                 VT_SCRIPT="$CANDIDATE/Contents/Resources/vt"
                 if [ -f "$VT_SCRIPT" ] && [ -x "$VT_SCRIPT" ]; then
                     VT_REAL_PATH="$(resolve_symlink_macos "$VT_SCRIPT")"
@@ -62,7 +62,7 @@ if [[ "$OSTYPE" == "darwin"* ]]; then
     # If not found yet, try standard locations
     if [ -z "$APP_PATH" ]; then
         for TRY_PATH in "/Applications/VibeTunnel.app" "$HOME/Applications/VibeTunnel.app"; do
-            if [ -d "$TRY_PATH" ] && [ -f "$TRY_PATH/Contents/Resources/vibetunnel" ]; then
+            if [ -d "$TRY_PATH" ] && ( [ -f "$TRY_PATH/Contents/Resources/vibetunnel-rs" ] || [ -f "$TRY_PATH/Contents/Resources/vibetunnel" ] ); then
                 VT_SCRIPT="$TRY_PATH/Contents/Resources/vt"
                 if [ -f "$VT_SCRIPT" ] && [ -x "$VT_SCRIPT" ]; then
                     # Avoid infinite recursion by checking if this is the same script
@@ -81,7 +81,7 @@ if [[ "$OSTYPE" == "darwin"* ]]; then
     if [ -z "$APP_PATH" ] && [ -z "$VIBETUNNEL_PREFER_DERIVED_DATA" ]; then
         # Try DerivedData (for development)
         for CANDIDATE in $(find ~/Library/Developer/Xcode/DerivedData -name "VibeTunnel.app" -type d 2>/dev/null | grep -v "\.dSYM" | grep -v "Index\.noindex"); do
-            if [ -f "$CANDIDATE/Contents/Resources/vibetunnel" ]; then
+            if [ -f "$CANDIDATE/Contents/Resources/vibetunnel-rs" ] || [ -f "$CANDIDATE/Contents/Resources/vibetunnel" ]; then
                 VT_SCRIPT="$CANDIDATE/Contents/Resources/vt"
                 if [ -f "$VT_SCRIPT" ] && [ -x "$VT_SCRIPT" ]; then
                     VT_REAL_PATH="$(resolve_symlink_macos "$VT_SCRIPT")"
@@ -100,7 +100,7 @@ if [[ "$OSTYPE" == "darwin"* ]]; then
         # If still not found, use mdfind as last resort
         if [ -z "$APP_PATH" ]; then
             for CANDIDATE in $(mdfind -name "VibeTunnel.app" 2>/dev/null | grep -v "\.dSYM"); do
-                if [ -f "$CANDIDATE/Contents/Resources/vibetunnel" ]; then
+                if [ -f "$CANDIDATE/Contents/Resources/vibetunnel-rs" ] || [ -f "$CANDIDATE/Contents/Resources/vibetunnel" ]; then
                     VT_SCRIPT="$CANDIDATE/Contents/Resources/vt"
                     if [ -f "$VT_SCRIPT" ] && [ -x "$VT_SCRIPT" ]; then
                         VT_REAL_PATH="$(resolve_symlink_macos "$VT_SCRIPT")"
@@ -117,7 +117,12 @@ if [[ "$OSTYPE" == "darwin"* ]]; then
     
     # If we found a Mac app but couldn't use its vt script, use its binary directly
     if [ -n "$APP_PATH" ]; then
-        VIBETUNNEL_BIN="$APP_PATH/Contents/Resources/vibetunnel"
+        if [ -f "$APP_PATH/Contents/Resources/vibetunnel-rs" ]; then
+            VIBETUNNEL_BIN="$APP_PATH/Contents/Resources/vibetunnel-rs"
+        else
+            VIBETUNNEL_BIN="$APP_PATH/Contents/Resources/vibetunnel"
+        fi
+
         if [ -f "$VIBETUNNEL_BIN" ]; then
             # Found Mac app bundle - will use this binary
             # Silent operation - no message printed
@@ -142,7 +147,7 @@ if [ -z "$VIBETUNNEL_BIN" ]; then
 fi
 
 if [ -z "$VIBETUNNEL_BIN" ] || [ ! -f "$VIBETUNNEL_BIN" ]; then
-    echo "Error: vibetunnel binary not found. Please ensure vibetunnel is installed." >&2
+    echo "Error: vibetunnel server binary not found. Please ensure vibetunnel is installed." >&2
     echo "Install with: npm install -g vibetunnel" >&2
     exit 1
 fi
@@ -181,6 +186,7 @@ if [ -n "$VIBETUNNEL_PREFER_DERIVED_DATA" ] && [ -n "$VIBETUNNEL_BIN" ] && [ "$S
     # Shorten path by removing /Contents/Resources/vibetunnel suffix
     DISPLAY_PATH=$(prettify_path "$VIBETUNNEL_BIN")
     DISPLAY_PATH=${DISPLAY_PATH%/Contents/Resources/vibetunnel}
+    DISPLAY_PATH=${DISPLAY_PATH%/Contents/Resources/vibetunnel-rs}
     echo -e "${GRAY}[VibeTunnel] ${DISPLAY_PATH}${RESET}"
     if [ -n "$VERSION_LINE" ] && [ -n "$BUILD_LINE" ]; then
         echo -e "${GRAY}[VibeTunnel] Version: ${VERSION_LINE#VibeTunnel Server } (${BUILD_LINE})${RESET}"

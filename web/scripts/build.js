@@ -5,6 +5,32 @@ const esbuild = require('esbuild');
 const { prodOptions } = require('./esbuild-config.js');
 const { nodePtyPlugin } = require('./node-pty-plugin.js');
 
+function shouldUseRustServer() {
+  return (
+    process.env.VIBETUNNEL_USE_RUST_SERVER === '1' ||
+    process.env.VIBETUNNEL_USE_RUST_SERVER === 'true' ||
+    process.argv.includes('--rust-server')
+  );
+}
+
+function buildRustServer() {
+  console.log('Building Rust server...');
+  execSync('cargo build --release --manifest-path rust-server/Cargo.toml', { stdio: 'inherit' });
+
+  const source = path.join(__dirname, '..', 'rust-server', 'target', 'release', 'vibetunnel-rs');
+  const nativeDir = path.join(__dirname, '..', 'native');
+  const target = path.join(nativeDir, 'vibetunnel-rs');
+
+  if (!fs.existsSync(source)) {
+    throw new Error(`Rust server binary not found at ${source}`);
+  }
+
+  fs.mkdirSync(nativeDir, { recursive: true });
+  fs.copyFileSync(source, target);
+  fs.chmodSync(target, 0o755);
+  console.log(`Rust server binary copied to ${target}`);
+}
+
 async function build() {
   console.log('Starting build process...');
   
@@ -57,70 +83,88 @@ async function build() {
     process.exit(1);
   }
 
-  // Build server TypeScript
-  console.log('Building server...');
-  execSync('npx tsc -p tsconfig.server.json', { stdio: 'inherit' });
+  const useRustServer = shouldUseRustServer();
 
-  // Bundle CLI
-  console.log('Bundling CLI...');
-  try {
-    await esbuild.build({
-      entryPoints: ['src/cli.ts'],
-      bundle: true,
-      platform: 'node',
-      target: 'node18',
-      format: 'cjs',
-      outfile: 'dist/vibetunnel-cli',
-      plugins: [nodePtyPlugin],
-      external: [
-        // 'node-pty', // Removed - handled by plugin
-        'authenticate-pam',
-        'compression',
-        'helmet',
-        'express',
-        'ghostty-web',
-        'ws',
-        'jsonwebtoken',
-        'web-push',
-        'bonjour-service',
-        'signal-exit',
-        'http-proxy-middleware',
-        'multer',
-        'mime-types',
-      ],
-      minify: true,
-      sourcemap: false,
-      loader: {
-        '.ts': 'ts',
-        '.js': 'js',
-      },
-    });
-    
-    // Read the file and ensure it has exactly one shebang
-    let content = fs.readFileSync('dist/vibetunnel-cli', 'utf8');
-    
-    // Remove any existing shebangs
-    content = content.replace(/^#!.*\n/gm, '');
-    
-    // Add a single shebang at the beginning
-    content = '#!/usr/bin/env node\n' + content;
-    
-    // Write the fixed content back
-    fs.writeFileSync('dist/vibetunnel-cli', content);
-    
-    // Make the CLI executable
-    fs.chmodSync('dist/vibetunnel-cli', '755');
-    console.log('CLI bundle created successfully');
-  } catch (error) {
-    console.error('CLI bundling failed:', error);
-    process.exit(1);
+  // Build server runtime
+  if (useRustServer) {
+    buildRustServer();
+  } else {
+    console.log('Building server...');
+    execSync('npx tsc -p tsconfig.server.json', { stdio: 'inherit' });
+  }
+
+  // Bundle CLI (TS path only)
+  if (!useRustServer) {
+    console.log('Bundling CLI...');
+    try {
+      await esbuild.build({
+        entryPoints: ['src/cli.ts'],
+        bundle: true,
+        platform: 'node',
+        target: 'node18',
+        format: 'cjs',
+        outfile: 'dist/vibetunnel-cli',
+        plugins: [nodePtyPlugin],
+        external: [
+          // 'node-pty', // Removed - handled by plugin
+          'authenticate-pam',
+          'compression',
+          'helmet',
+          'express',
+          'ghostty-web',
+          'ws',
+          'jsonwebtoken',
+          'web-push',
+          'bonjour-service',
+          'signal-exit',
+          'http-proxy-middleware',
+          'multer',
+          'mime-types',
+        ],
+        minify: true,
+        sourcemap: false,
+        loader: {
+          '.ts': 'ts',
+          '.js': 'js',
+        },
+      });
+
+      // Read the file and ensure it has exactly one shebang
+      let content = fs.readFileSync('dist/vibetunnel-cli', 'utf8');
+
+      // Remove any existing shebangs
+      content = content.replace(/^#!.*\n/gm, '');
+
+      // Add a single shebang at the beginning
+      content = '#!/usr/bin/env node\n' + content;
+
+      // Write the fixed content back
+      fs.writeFileSync('dist/vibetunnel-cli', content);
+
+      // Make the CLI executable
+      fs.chmodSync('dist/vibetunnel-cli', '755');
+      console.log('CLI bundle created successfully');
+    } catch (error) {
+      console.error('CLI bundling failed:', error);
+      process.exit(1);
+    }
   }
 
   // Build zig forwarder first.
   // `build-native.js` runs verification in CI which expects the forwarder to exist.
   console.log('Building zig forwarder...');
-  execSync('node scripts/build-fwd-zig.js', { stdio: 'inherit' });
+  if (useRustServer) {
+    execSync('VIBETUNNEL_USE_RUST_SERVER=1 node scripts/build-fwd-zig.js', { stdio: 'inherit' });
+  } else {
+    execSync('node scripts/build-fwd-zig.js', { stdio: 'inherit' });
+  }
 
+
+  if (useRustServer) {
+    console.log('Skipping Node SEA build for Rust server mode.');
+    console.log('Build completed successfully!');
+    return;
+  }
 
   const shouldBuildSea =
     process.env.VIBETUNNEL_BUILD_SEA === '1' ||

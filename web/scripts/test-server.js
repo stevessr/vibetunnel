@@ -5,10 +5,19 @@ const { spawn, execSync } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 
+function shouldUseRustServer() {
+  return (
+    process.env.VIBETUNNEL_USE_RUST_SERVER === '1' ||
+    process.env.VIBETUNNEL_USE_RUST_SERVER === 'true' ||
+    process.argv.includes('--rust-server')
+  );
+}
+
 const projectRoot = path.join(__dirname, '..');
 
 // Check if we're in VIBETUNNEL_SEA mode and have the native executable
 const nativeExecutable = path.join(projectRoot, 'native/vibetunnel');
+const rustExecutable = path.join(projectRoot, 'native/vibetunnel-rs');
 const distCliPath = path.join(projectRoot, 'dist/cli.js');
 let cliPath;
 let useNode = true;
@@ -88,7 +97,31 @@ function isClientUpToDate() {
   }
 }
 
-if (process.env.VIBETUNNEL_SEA === 'true' && fs.existsSync(nativeExecutable)) {
+if (shouldUseRustServer()) {
+  if (!fs.existsSync(rustExecutable)) {
+    console.log('Building Rust server for tests...');
+    try {
+      execSync('cargo build --release --manifest-path rust-server/Cargo.toml', {
+        stdio: 'inherit',
+        cwd: projectRoot,
+      });
+      const builtPath = path.join(projectRoot, 'rust-server', 'target', 'release', 'vibetunnel-rs');
+      if (!fs.existsSync(builtPath)) {
+        throw new Error(`Rust binary not found at ${builtPath}`);
+      }
+      fs.mkdirSync(path.join(projectRoot, 'native'), { recursive: true });
+      fs.copyFileSync(builtPath, rustExecutable);
+      fs.chmodSync(rustExecutable, 0o755);
+    } catch (error) {
+      console.error('Failed to build rust server:', error);
+      process.exit(1);
+    }
+  }
+
+  console.log('Using Rust executable for tests');
+  cliPath = rustExecutable;
+  useNode = false;
+} else if (process.env.VIBETUNNEL_SEA === 'true' && fs.existsSync(nativeExecutable)) {
   console.log('Using native executable for tests (VIBETUNNEL_SEA mode)');
   cliPath = nativeExecutable;
   useNode = false;
@@ -135,11 +168,13 @@ if (process.env.VIBETUNNEL_SEA === 'true' && fs.existsSync(nativeExecutable)) {
   }
 }
 
-// Ensure native modules are available
-execSync('node scripts/ensure-native-modules.js', { 
-  stdio: 'inherit',
-  cwd: projectRoot
-});
+if (!shouldUseRustServer()) {
+  // Ensure native modules are available
+  execSync('node scripts/ensure-native-modules.js', {
+    stdio: 'inherit',
+    cwd: projectRoot
+  });
+}
 
 // Ensure static assets exist (incl. ghostty-web WASM in public/)
 execSync('node scripts/copy-assets.js', {

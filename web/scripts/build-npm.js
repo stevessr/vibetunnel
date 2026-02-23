@@ -561,6 +561,14 @@ function validatePackageHybrid() {
   console.log('✅ Hybrid package validation passed\n');
 }
 
+function shouldUseRustServer() {
+  return (
+    process.env.VIBETUNNEL_USE_RUST_SERVER === '1' ||
+    process.env.VIBETUNNEL_USE_RUST_SERVER === 'true' ||
+    process.argv.includes('--rust-server')
+  );
+}
+
 // Main build process
 async function main() {
   // Step 0: Clean previous build
@@ -572,10 +580,12 @@ async function main() {
   
   // Step 1: Standard build process
   console.log('\n1️⃣ Running standard build process...\n');
+  const useRustServer = shouldUseRustServer();
+  const buildCommand = useRustServer ? 'VIBETUNNEL_USE_RUST_SERVER=1 npm run build -- --rust-server' : 'npm run build';
   try {
-    execSync('npm run build', { 
-      cwd: ROOT_DIR, 
-      stdio: 'inherit' 
+    execSync(buildCommand, {
+      cwd: ROOT_DIR,
+      stdio: 'inherit'
     });
     console.log('✅ Standard build completed\n');
   } catch (error) {
@@ -608,11 +618,18 @@ async function main() {
   
   // Step 3: Copy necessary files to dist-npm
   console.log('3️⃣ Copying files to dist-npm...\n');
-  
+
   const filesToCopy = [
     // Compiled CLI
-    { src: 'dist/vibetunnel-cli', dest: 'lib/cli.js' },
-    { src: 'dist/tsconfig.server.tsbuildinfo', dest: 'lib/tsconfig.server.tsbuildinfo' },
+    ...(useRustServer
+      ? [
+          { src: 'native/vibetunnel-rs', dest: 'lib/vibetunnel-rs' },
+          { src: 'rust-server/fixtures', dest: 'lib/rust-fixtures' },
+        ]
+      : [
+          { src: 'dist/vibetunnel-cli', dest: 'lib/cli.js' },
+          { src: 'dist/tsconfig.server.tsbuildinfo', dest: 'lib/tsconfig.server.tsbuildinfo' },
+        ]),
     
     // Bin scripts
     { src: 'bin', dest: 'bin' },
@@ -742,32 +759,37 @@ async function main() {
     };
   }
   
+  if (useRustServer) {
+    npmPackageJson.main = 'lib/vibetunnel-rs';
+  }
+
   fs.writeFileSync(
     path.join(DIST_DIR, 'package.json'),
     JSON.stringify(npmPackageJson, null, 2) + '\n'
   );
 
-  // Step 6: Fix the CLI structure and bin scripts
-  console.log('\n6️⃣ Fixing CLI structure and bin scripts...\n');
-  
-  // The dist/vibetunnel-cli was copied to lib/cli.js
-  // We need to rename it and create a wrapper
-  const cliPath = path.join(DIST_DIR, 'lib', 'cli.js');
-  const cliBundlePath = path.join(DIST_DIR, 'lib', 'vibetunnel-cli');
-  
-  // Rename the bundle
-  fs.renameSync(cliPath, cliBundlePath);
-  
-  // Create a simple wrapper that requires the bundle
-  const cliWrapperContent = `#!/usr/bin/env node
+  // Step 7: Fix the CLI structure and bin scripts
+  console.log('\n7️⃣ Fixing CLI structure and bin scripts...\n');
+
+  if (!useRustServer) {
+    // The dist/vibetunnel-cli was copied to lib/cli.js
+    // We need to rename it and create a wrapper
+    const cliPath = path.join(DIST_DIR, 'lib', 'cli.js');
+    const cliBundlePath = path.join(DIST_DIR, 'lib', 'vibetunnel-cli');
+
+    // Rename the bundle
+    fs.renameSync(cliPath, cliBundlePath);
+
+    // Create a simple wrapper that requires the bundle
+    const cliWrapperContent = `#!/usr/bin/env node
 require('./vibetunnel-cli');
 `;
-  
-  fs.writeFileSync(cliPath, cliWrapperContent, { mode: 0o755 });
-  
-  // Fix bin scripts to point to correct path
-  const binVibetunnelPath = path.join(DIST_DIR, 'bin', 'vibetunnel');
-  const binVibetunnelContent = `#!/usr/bin/env node
+
+    fs.writeFileSync(cliPath, cliWrapperContent, { mode: 0o755 });
+
+    // Fix bin scripts to point to correct path
+    const binVibetunnelPath = path.join(DIST_DIR, 'bin', 'vibetunnel');
+    const binVibetunnelContent = `#!/usr/bin/env node
 
 // Start the CLI - it handles all command routing including 'fwd'
 const { spawn } = require('child_process');
@@ -785,8 +807,8 @@ child.on('exit', (code, signal) => {
   if (signal) {
     // Process was killed by signal, exit with 128 + signal number convention
     // Common signals: SIGTERM=15, SIGINT=2, SIGKILL=9
-    const signalExitCode = signal === 'SIGTERM' ? 143 : 
-                          signal === 'SIGINT' ? 130 : 
+    const signalExitCode = signal === 'SIGTERM' ? 143 :
+                          signal === 'SIGINT' ? 130 :
                           signal === 'SIGKILL' ? 137 : 128;
     process.exit(signalExitCode);
   } else {
@@ -795,13 +817,38 @@ child.on('exit', (code, signal) => {
   }
 });
 `;
-  fs.writeFileSync(binVibetunnelPath, binVibetunnelContent, { mode: 0o755 });
-  console.log('  ✓ Fixed bin/vibetunnel path');
+    fs.writeFileSync(binVibetunnelPath, binVibetunnelContent, { mode: 0o755 });
+    console.log('  ✓ Fixed bin/vibetunnel path');
+  } else {
+    const binVibetunnelPath = path.join(DIST_DIR, 'bin', 'vibetunnel');
+    const rustEntryContent = `#!/usr/bin/env node
+
+const { spawn } = require('child_process');
+const path = require('path');
+
+const rustPath = path.join(__dirname, '..', 'lib', 'vibetunnel-rs');
+const args = process.argv.slice(2);
+
+const child = spawn(rustPath, args, {
+  stdio: 'inherit',
+  env: process.env
+});
+
+child.on('exit', (code, signal) => {
+  if (signal) {
+    process.exit(signal === 'SIGTERM' ? 143 : signal === 'SIGINT' ? 130 : signal === 'SIGKILL' ? 137 : 128);
+  }
+  process.exit(code ?? 0);
+});
+`;
+    fs.writeFileSync(binVibetunnelPath, rustEntryContent, { mode: 0o755 });
+    console.log('  ✓ Configured bin/vibetunnel for Rust runtime');
+  }
   
   // vt script doesn't need fixing - it dynamically finds the binary
   
-  // Step 7: Copy README files
-  console.log('\n7️⃣ Copying README files...\n');
+  // Step 8: Copy README files
+  console.log('\n8️⃣ Copying README files...\n');
   
   // Copy main README
   const sourceReadmePath = path.join(ROOT_DIR, 'README.md');
@@ -831,8 +878,8 @@ child.on('exit', (code, signal) => {
     console.log('  ✓ Copied Dockerfile.standalone');
   }
   
-  // Step 8: Clean up test files in dist-npm
-  console.log('\n8️⃣ Cleaning up test files...\n');
+  // Step 9: Clean up test files in dist-npm
+  console.log('\n9️⃣ Cleaning up test files...\n');
   const testFiles = [
     'public/bundle/test.js',
     'public/test'  // Remove entire test directory
@@ -851,11 +898,11 @@ child.on('exit', (code, signal) => {
     }
   }
   
-  // Step 9: Validate package with our comprehensive checks
+  // Step 10: Validate package with our comprehensive checks
   validatePackageHybrid();
 
-  // Step 10: Create npm package
-  console.log('\n9️⃣ Creating npm package...\n');
+  // Step 11: Create npm package
+  console.log('\n1️⃣1️⃣ Creating npm package...\n');
   try {
     execSync('npm pack', {
       cwd: DIST_DIR,

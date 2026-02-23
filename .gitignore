@@ -175,3 +175,4 @@ mac/build-test/
 *.crt
 *.key
 .tmp/
+target/

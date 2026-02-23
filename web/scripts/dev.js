@@ -3,6 +3,14 @@ const path = require('path');
 const esbuild = require('esbuild');
 const { devOptions } = require('./esbuild-config.js');
 
+function shouldUseRustServer() {
+  return (
+    process.env.VIBETUNNEL_USE_RUST_SERVER === '1' ||
+    process.env.VIBETUNNEL_USE_RUST_SERVER === 'true' ||
+    process.argv.includes('--rust-server')
+  );
+}
+
 console.log('Starting development mode...');
 
 // Validate version sync first
@@ -121,8 +129,15 @@ const commands = [
 
 // Add server watching if not client-only
 if (watchServer) {
-  const serverCommand = ['pnpm', ['exec', 'tsx', 'watch', 'src/cli.ts', '--no-auth', ...serverArgs]];
-  commands.push(serverCommand);
+  const useRustServer = shouldUseRustServer();
+  if (useRustServer) {
+    const rustArgs = ['run', '--manifest-path', 'rust-server/Cargo.toml', '--', '--no-auth', ...serverArgs];
+    const serverCommand = ['cargo', rustArgs];
+    commands.push(serverCommand);
+  } else {
+    const serverCommand = ['pnpm', ['exec', 'tsx', 'watch', 'src/cli.ts', '--no-auth', ...serverArgs]];
+    commands.push(serverCommand);
+  }
 }
 
 // Set up esbuild contexts for watching

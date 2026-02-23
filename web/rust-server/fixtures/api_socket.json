@@ -1,0 +1,17 @@
+{
+  "description": "api.sock framing fixtures from TS oracle",
+  "cases": [
+    {
+      "name": "status_request",
+      "hex": "20000000027b7d"
+    },
+    {
+      "name": "status_update",
+      "hex": "03000000237b22617070223a22636c61756465222c22737461747573223a2272756e6e696e67227d"
+    },
+    {
+      "name": "heartbeat",
+      "hex": "0400000000"
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "description": "WS v3 contract fixtures from TS oracle",
+  "cases": [
+    {
+      "name": "ping_empty",
+      "hex": "545603280000000000000000"
+    },
+    {
+      "name": "stdout_abc_payload010203",
+      "hex": "545603140300000061626303000000010203"
+    },
+    {
+      "name": "subscribe_with_intervals",
+      "hex": "5456030a06000000736573732d310c000000070000000a00000014000000"
+    }
+  ]
+}

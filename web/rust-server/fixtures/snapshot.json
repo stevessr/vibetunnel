@@ -1,0 +1,17 @@
+{
+  "description": "terminal snapshot encoding fixtures from TS oracle",
+  "cases": [
+    {
+      "name": "single_empty_cell",
+      "hex": "54560100010000000100000000000000000000000000000000000000fe01"
+    },
+    {
+      "name": "ascii_with_style",
+      "hex": "54560100020000000100000000000000010000000000000000000000fd02000141b14201c411"
+    },
+    {
+      "name": "unicode_rgb_fg",
+      "hex": "54560100010000000100000000000000000000000000000000000000fd0100ea02cebb00112233"
+    }
+  ]
+}

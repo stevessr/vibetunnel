@@ -31,6 +31,7 @@ const pkg = fs.existsSync(pkgPath) ? JSON.parse(fs.readFileSync(pkgPath, 'utf8')
 const version = pkg.version || 'unknown';
 
 const zigOut = path.join(zigProject, 'zig-out', 'bin', 'vibetunnel-fwd');
+const rustOut = path.join(webRoot, 'rust-server', 'target', 'release', 'vibetunnel-rs');
 const nativeOutDir = path.join(webRoot, 'native');
 const binOutDir = path.join(webRoot, 'bin');
 
@@ -62,6 +63,19 @@ if (!fs.existsSync(zigOut)) {
   process.exit(1);
 }
 
+if (process.env.VIBETUNNEL_USE_RUST_SERVER === '1' || process.env.VIBETUNNEL_USE_RUST_SERVER === 'true') {
+  console.log('Building Rust server binary (rust mode)...');
+  execFileSync('cargo', ['build', '--release', '--manifest-path', 'rust-server/Cargo.toml'], {
+    cwd: webRoot,
+    stdio: 'inherit',
+  });
+
+  if (!fs.existsSync(rustOut)) {
+    console.error('ERROR: cargo build did not produce vibetunnel-rs binary');
+    process.exit(1);
+  }
+}
+
 ensureDir(nativeOutDir);
 ensureDir(binOutDir);
 
@@ -75,3 +89,10 @@ fs.chmodSync(binDest, 0o755);
 
 console.log(`✓ zig forwarder built: ${path.relative(repoRoot, nativeDest)}`);
 console.log(`✓ zig forwarder installed: ${path.relative(repoRoot, binDest)}`);
+
+if (fs.existsSync(rustOut)) {
+  const rustNativeDest = path.join(nativeOutDir, 'vibetunnel-rs');
+  fs.copyFileSync(rustOut, rustNativeDest);
+  fs.chmodSync(rustNativeDest, 0o755);
+  console.log(`✓ rust server built: ${path.relative(repoRoot, rustNativeDest)}`);
+}

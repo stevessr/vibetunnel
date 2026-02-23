@@ -1,0 +1,9 @@
+{
+  "description": "control.sock length-prefixed JSON fixtures from TS oracle",
+  "cases": [
+    {
+      "name": "ready_event",
+      "hex": "0000003e7b226964223a2231222c2274797065223a226576656e74222c2263617465676f7279223a2273797374656d222c22616374696f6e223a227265616479227d"
+    }
+  ]
+}

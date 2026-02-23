@@ -130,10 +130,13 @@ final class BunServer {
     }
 
     private func startProductionServer() async throws {
-        // Get the vibetunnel binary path (the Bun executable)
-        guard let binaryPath = Bundle.main.path(forResource: "vibetunnel", ofType: nil) else {
+        // Prefer Rust server binary when bundled, otherwise fallback to vibetunnel SEA
+        let rustBinaryPath = Bundle.main.path(forResource: "vibetunnel-rs", ofType: nil)
+        let primaryBinary = rustBinaryPath ?? Bundle.main.path(forResource: "vibetunnel", ofType: nil)
+
+        guard let binaryPath = primaryBinary else {
             let error = BunServerError.binaryNotFound
-            self.logger.error("vibetunnel binary not found in bundle")
+            self.logger.error("server binary not found in bundle (expected vibetunnel-rs or vibetunnel)")
 
             // Additional diagnostics for CI debugging
             self.logger.error("Bundle path: \(Bundle.main.bundlePath)")
@@ -152,7 +155,11 @@ final class BunServer {
             throw error
         }
 
-        self.logger.info("Using Bun executable at: \(binaryPath)")
+        if rustBinaryPath != nil {
+            self.logger.info("Using Rust server executable at: \(binaryPath)")
+        } else {
+            self.logger.info("Using Bun executable at: \(binaryPath)")
+        }
 
         // Ensure binary is executable
         do {
@@ -172,10 +179,10 @@ final class BunServer {
             {
                 self.logger
                     .info(
-                        "vibetunnel binary size: \(fileSize.intValue) bytes, permissions: \(String(permissions.intValue, radix: 8))")
+                        "server binary size: \(fileSize.intValue) bytes, permissions: \(String(permissions.intValue, radix: 8))")
             }
         } else if !fileExists {
-            self.logger.error("vibetunnel binary NOT FOUND at: \(binaryPath)")
+            self.logger.error("server binary NOT FOUND at: \(binaryPath)")
         }
 
         // Create the process using login shell
@@ -199,7 +206,6 @@ final class BunServer {
         }
 
         // Build the vibetunnel command arguments as an array
-        // Add Node.js V8 memory options first
         var vibetunnelArgs = ["--port", String(port), "--bind", bindAddress]
 
         // Add authentication flags based on configuration
@@ -1022,7 +1028,7 @@ enum BunServerError: LocalizedError, Equatable {
     var errorDescription: String? {
         switch self {
         case .binaryNotFound:
-            "The vibetunnel binary was not found in the app bundle"
+            "The server binary (vibetunnel-rs or vibetunnel) was not found in the app bundle"
         case .processFailedToStart:
             "The server process failed to start"
         case .invalidPort:
