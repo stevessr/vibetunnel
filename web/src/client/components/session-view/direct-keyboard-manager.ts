@@ -301,10 +301,10 @@ export class DirectKeyboardManager extends ManagerEventEmitter {
         return;
       }
 
-      // Don't send input to terminal if mobile input overlay or Ctrl overlay is visible
-      const showMobileInput = this.callbacks?.getShowMobileInput() ?? false;
+      // Don't send input to terminal if chat mode or Ctrl overlay is visible
+      const chatMode = this.callbacks?.getChatMode() ?? false;
       const showCtrlAlpha = this.callbacks?.getShowCtrlAlpha() ?? false;
-      if (showMobileInput || showCtrlAlpha) {
+      if (chatMode || showCtrlAlpha) {
         return;
       }
 
@@ -451,11 +451,18 @@ export class DirectKeyboardManager extends ManagerEventEmitter {
       if (this.keyboardMode) {
         logger.log('In keyboard mode - maintaining focus');
 
+        // Do not steal focus from visible text inputs (chat mode)
+        if (this.callbacks?.getChatMode() ?? false) {
+          logger.log('Chat mode active, skip hidden-input refocus');
+          return;
+        }
+
         // Add a small delay to allow Done button to exit keyboard mode first
         setTimeout(() => {
           // Re-check keyboard mode after delay - Done button might have exited it
           if (
             this.keyboardMode &&
+            !(this.callbacks?.getChatMode() ?? false) &&
             this.hiddenInput &&
             document.activeElement !== this.hiddenInput
           ) {
