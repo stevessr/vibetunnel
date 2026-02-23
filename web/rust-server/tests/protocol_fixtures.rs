@@ -93,7 +93,12 @@ fn api_socket_fixture_parse_and_encode() {
         let mut parser = socket_protocol::MessageParser::new();
         parser.add_data(&bytes);
         let parsed = parser.parse_messages();
-        assert_eq!(parsed.len(), 1, "expected exactly one message for {}", case.name);
+        assert_eq!(
+            parsed.len(),
+            1,
+            "expected exactly one message for {}",
+            case.name
+        );
 
         let msg = &parsed[0];
         let re = socket_protocol::frame_message(msg.ty, &msg.payload);
@@ -131,9 +136,15 @@ fn api_socket_parser_keeps_unknown_message_type() {
     let parsed = parser.parse_messages();
 
     assert_eq!(parsed.len(), 1);
-    assert!(matches!(parsed[0].ty, socket_protocol::MessageType::Unknown(0xff)));
+    assert!(matches!(
+        parsed[0].ty,
+        socket_protocol::MessageType::Unknown(0xff)
+    ));
     assert_eq!(parsed[0].payload, b"abc");
-    assert_eq!(socket_protocol::frame_message(parsed[0].ty, &parsed[0].payload), bytes);
+    assert_eq!(
+        socket_protocol::frame_message(parsed[0].ty, &parsed[0].payload),
+        bytes
+    );
 }
 
 #[test]
@@ -146,7 +157,12 @@ fn control_socket_fixture_parse_and_encode() {
         let mut parser = control_sock::ControlMessageParser::new();
         parser.add_data(&bytes);
         let parsed = parser.parse_messages();
-        assert_eq!(parsed.len(), 1, "expected one control message for {}", case.name);
+        assert_eq!(
+            parsed.len(),
+            1,
+            "expected one control message for {}",
+            case.name
+        );
 
         let re = control_sock::encode_control_message(&parsed[0]);
         assert_eq!(re, bytes, "fixture mismatch: {}", case.name);

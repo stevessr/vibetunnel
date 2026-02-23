@@ -30,9 +30,12 @@ impl ControlMessageParser {
                 break;
             }
 
-            let len =
-                u32::from_be_bytes([self.buffer[0], self.buffer[1], self.buffer[2], self.buffer[3]])
-                    as usize;
+            let len = u32::from_be_bytes([
+                self.buffer[0],
+                self.buffer[1],
+                self.buffer[2],
+                self.buffer[3],
+            ]) as usize;
 
             if len == 0 {
                 self.buffer.clear();

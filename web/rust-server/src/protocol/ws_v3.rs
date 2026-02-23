@@ -168,7 +168,9 @@ pub fn decode_subscribe_payload(payload: &[u8]) -> Option<WsV3SubscribePayload> 
 
     Some(WsV3SubscribePayload {
         flags: u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]),
-        snapshot_min_interval_ms: u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]),
+        snapshot_min_interval_ms: u32::from_le_bytes([
+            payload[4], payload[5], payload[6], payload[7],
+        ]),
         snapshot_max_interval_ms: u32::from_le_bytes([
             payload[8],
             payload[9],

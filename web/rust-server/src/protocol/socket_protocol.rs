@@ -112,9 +112,12 @@ impl MessageParser {
             }
 
             let ty_raw = self.buffer[0];
-            let len =
-                u32::from_be_bytes([self.buffer[1], self.buffer[2], self.buffer[3], self.buffer[4]])
-                    as usize;
+            let len = u32::from_be_bytes([
+                self.buffer[1],
+                self.buffer[2],
+                self.buffer[3],
+                self.buffer[4],
+            ]) as usize;
 
             if self.buffer.len() < 5 + len {
                 break;

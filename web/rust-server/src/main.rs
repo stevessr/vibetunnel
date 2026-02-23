@@ -656,6 +656,12 @@ struct MultiplexerAttachRequest {
     window_index: Option<u32>,
     #[serde(rename = "paneIndex")]
     pane_index: Option<u32>,
+    cols: Option<u16>,
+    rows: Option<u16>,
+    #[serde(rename = "workingDir")]
+    working_dir: Option<String>,
+    #[serde(rename = "titleMode")]
+    title_mode: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2102,22 +2108,189 @@ fn trim_old_git_notifications(entries: &mut Vec<GitNotificationEntry>) {
     entries.retain(|entry| entry.timestamp_ms >= cutoff_ms);
 }
 
+fn multiplexer_available(command: &str) -> bool {
+    ProcessCommand::new("which")
+        .arg(command)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn strip_ansi_codes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            if matches!(chars.peek(), Some('[')) {
+                let _ = chars.next();
+                while let Some(code_ch) = chars.next() {
+                    if code_ch.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+                continue;
+            }
+        }
+        out.push(ch);
+    }
+
+    out
+}
+
+fn is_screen_full_session_name(name: &str) -> bool {
+    let Some((pid, rest)) = name.split_once('.') else {
+        return false;
+    };
+    !rest.is_empty() && pid.chars().all(|ch| ch.is_ascii_digit())
+}
+
+fn list_zellij_sessions() -> Vec<MultiplexerSession> {
+    let output = match ProcessCommand::new("zellij").arg("list-sessions").output() {
+        Ok(output) => output,
+        Err(_) => return Vec::new(),
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    if stdout.contains("No active zellij sessions found") {
+        return Vec::new();
+    }
+
+    stdout
+        .lines()
+        .filter_map(|raw_line| {
+            let clean_line = strip_ansi_codes(raw_line).trim().to_string();
+            if clean_line.is_empty() {
+                return None;
+            }
+
+            let name = clean_line.split('[').next().unwrap_or_default().trim().to_string();
+            if name.is_empty() {
+                return None;
+            }
+
+            let exited = clean_line.contains("[EXITED]");
+            let activity = if let Some(start) = clean_line.find("[Created ") {
+                let created_start = start + "[Created ".len();
+                if let Some(end_rel) = clean_line[created_start..].find(']') {
+                    clean_line[created_start..created_start + end_rel].to_string()
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            };
+
+            Some(MultiplexerSession {
+                name,
+                session_type: "zellij".to_string(),
+                current: false,
+                attached: false,
+                windows: 1,
+                activity,
+                exited,
+            })
+        })
+        .collect()
+}
+
+fn list_screen_sessions() -> Vec<MultiplexerSession> {
+    let output = match ProcessCommand::new("screen").arg("-ls").output() {
+        Ok(output) => output,
+        Err(_) => return Vec::new(),
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    if stdout.contains("No Sockets found") {
+        return Vec::new();
+    }
+
+    stdout
+        .lines()
+        .filter_map(|raw_line| {
+            let line = raw_line.trim();
+            if line.is_empty() {
+                return None;
+            }
+
+            let open_idx = line.rfind('(')?;
+            let close_idx = line.rfind(')')?;
+            if close_idx <= open_idx {
+                return None;
+            }
+
+            let session_name = line[..open_idx].trim();
+            if !is_screen_full_session_name(session_name) {
+                return None;
+            }
+
+            let status = line[open_idx + 1..close_idx].trim().to_ascii_lowercase();
+            let attached = status.starts_with("attached");
+            let exited = status.contains("dead");
+
+            Some(MultiplexerSession {
+                name: session_name.to_string(),
+                session_type: "screen".to_string(),
+                current: false,
+                attached,
+                windows: 1,
+                activity: String::new(),
+                exited,
+            })
+        })
+        .collect()
+}
+
+fn resolve_screen_session_name(session_name: &str) -> Option<String> {
+    if is_screen_full_session_name(session_name) {
+        return Some(session_name.to_string());
+    }
+
+    for session in list_screen_sessions() {
+        if let Some((_, simple_name)) = session.name.split_once('.') {
+            if simple_name == session_name {
+                return Some(session.name);
+            }
+        }
+    }
+
+    None
+}
+
 fn default_multiplexer_status(state: &MultiplexerState) -> serde_json::Value {
+    let tmux_available = multiplexer_available("tmux");
+    let zellij_available = multiplexer_available("zellij");
+    let screen_available = multiplexer_available("screen");
+
+    let zellij_sessions = if zellij_available {
+        list_zellij_sessions()
+    } else {
+        Vec::new()
+    };
+
+    let screen_sessions = if screen_available {
+        list_screen_sessions()
+    } else {
+        Vec::new()
+    };
+
     serde_json::json!({
         "tmux": {
-            "available": true,
+            "available": tmux_available,
             "type": "tmux",
             "sessions": state.tmux,
         },
         "zellij": {
-            "available": true,
+            "available": zellij_available,
             "type": "zellij",
-            "sessions": state.zellij,
+            "sessions": zellij_sessions,
         },
         "screen": {
-            "available": true,
+            "available": screen_available,
             "type": "screen",
-            "sessions": state.screen,
+            "sessions": screen_sessions,
         }
     })
 }
@@ -5575,30 +5748,105 @@ async fn api_multiplexer_create_session(
             .into_response();
     };
 
-    let session = MultiplexerSession {
-        name: name.clone(),
-        session_type: mux_type.clone(),
-        current: false,
-        attached: false,
-        windows: 1,
-        activity: now_iso(),
-        exited: false,
-    };
+    if !multiplexer_available(&mux_type) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": format!("{mux_type} is not available") })),
+        )
+            .into_response();
+    }
 
-    let mut mux = state.multiplexer_state.lock().await;
     match mux_type.as_str() {
-        "tmux" => {
-            mux.tmux.retain(|s| s.name != name);
-            mux.tmux.push(session);
-        }
+        "tmux" => match ProcessCommand::new("tmux")
+            .args(["new-session", "-d", "-s", &name])
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                let mut mux = state.multiplexer_state.lock().await;
+                mux.tmux.retain(|s| s.name != name);
+                mux.tmux.push(MultiplexerSession {
+                    name: name.clone(),
+                    session_type: "tmux".to_string(),
+                    current: false,
+                    attached: false,
+                    windows: 1,
+                    activity: now_iso(),
+                    exited: false,
+                });
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                let message = if stderr.is_empty() {
+                    "Failed to create tmux session".to_string()
+                } else {
+                    stderr
+                };
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": message })),
+                )
+                    .into_response();
+            }
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": format!("Failed to create tmux session: {error}") })),
+                )
+                    .into_response();
+            }
+        },
         "zellij" => {
-            mux.zellij.retain(|s| s.name != name);
-            mux.zellij.push(session);
+            // Zellij creates session on first attach with `zellij attach -c`.
+            // Keep this endpoint as a validated no-op for compatibility.
         }
-        "screen" => {
-            mux.screen.retain(|s| s.name != name);
-            mux.screen.push(session);
-        }
+        "screen" => match ProcessCommand::new("screen")
+            .args(["-dmS", &name])
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                let mut mux = state.multiplexer_state.lock().await;
+                mux.screen.retain(|s| {
+                    if s.name == name {
+                        return false;
+                    }
+                    if let Some((_, simple_name)) = s.name.split_once('.') {
+                        return simple_name != name;
+                    }
+                    true
+                });
+                if let Some(created_name) = resolve_screen_session_name(&name) {
+                    mux.screen.push(MultiplexerSession {
+                        name: created_name,
+                        session_type: "screen".to_string(),
+                        current: false,
+                        attached: false,
+                        windows: 1,
+                        activity: now_iso(),
+                        exited: false,
+                    });
+                }
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                let message = if stderr.is_empty() {
+                    "Failed to create screen session".to_string()
+                } else {
+                    stderr
+                };
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": message })),
+                )
+                    .into_response();
+            }
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": format!("Failed to create screen session: {error}") })),
+                )
+                    .into_response();
+            }
+        },
         _ => {
             return (
                 StatusCode::BAD_REQUEST,
@@ -5635,6 +5883,20 @@ async fn api_multiplexer_attach(
             .into_response();
     };
 
+    if !multiplexer_available(&mux_type) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": format!("{mux_type} is not available") })),
+        )
+            .into_response();
+    }
+
+    let normalized_session_name = if mux_type == "screen" {
+        resolve_screen_session_name(&session_name).unwrap_or_else(|| session_name.clone())
+    } else {
+        session_name.clone()
+    };
+
     {
         let mut mux = state.multiplexer_state.lock().await;
         let target_list = match mux_type.as_str() {
@@ -5650,9 +5912,9 @@ async fn api_multiplexer_attach(
             }
         };
 
-        if !target_list.iter().any(|s| s.name == session_name) {
+        if !target_list.iter().any(|s| s.name == normalized_session_name) {
             target_list.push(MultiplexerSession {
-                name: session_name.clone(),
+                name: normalized_session_name.clone(),
                 session_type: mux_type.clone(),
                 current: true,
                 attached: true,
@@ -5662,7 +5924,7 @@ async fn api_multiplexer_attach(
             });
         } else {
             for session in target_list.iter_mut() {
-                if session.name == session_name {
+                if session.name == normalized_session_name {
                     session.current = true;
                     session.attached = true;
                     session.activity = now_iso();
@@ -5671,29 +5933,128 @@ async fn api_multiplexer_attach(
         }
     }
 
-    let session_id = uuid::Uuid::new_v4().to_string();
-    let now = now_iso();
-    let mut sessions = state.sessions.lock().await;
-    sessions.push(SessionEntry {
-        id: session_id.clone(),
-        name: format!("{}:{}", mux_type, session_name),
-        command: vec![mux_type.clone(), "attach".to_string(), session_name.clone()],
-        working_dir: std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
+    let mut command = match mux_type.as_str() {
+        "tmux" => {
+            let target = if let Some(window_index) = payload.window_index {
+                format!("{normalized_session_name}:{window_index}")
+            } else {
+                normalized_session_name.clone()
+            };
+            vec!["tmux".to_string(), "attach-session".to_string(), "-t".to_string(), target]
+        }
+        "zellij" => vec![
+            "zellij".to_string(),
+            "attach".to_string(),
+            "-c".to_string(),
+            normalized_session_name.clone(),
+        ],
+        "screen" => vec![
+            "screen".to_string(),
+            "-r".to_string(),
+            normalized_session_name.clone(),
+        ],
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "Unsupported multiplexer type" })),
+            )
+                .into_response();
+        }
+    };
+
+    if mux_type == "screen" && !is_screen_full_session_name(&normalized_session_name) {
+        command = vec!["screen".to_string(), "-R".to_string(), normalized_session_name.clone()];
+    }
+
+    let fallback_working_dir = std::env::current_dir()
+        .unwrap_or_default()
+        .display()
+        .to_string();
+    let working_dir_input = payload.working_dir.unwrap_or_default();
+    let mut working_dir = if working_dir_input.trim().is_empty() {
+        fallback_working_dir.clone()
+    } else {
+        resolve_absolute_path(&working_dir_input)
             .to_string_lossy()
-            .to_string(),
+            .to_string()
+    };
+    if !Path::new(&working_dir).is_dir() {
+        working_dir = fallback_working_dir;
+    }
+
+    let session_id = uuid_like();
+    let now = now_iso();
+
+    let mut initial_cols: Option<u16> = None;
+    let mut initial_rows: Option<u16> = None;
+    if let (Some(cols), Some(rows)) = (payload.cols, payload.rows) {
+        if (1..=1000).contains(&cols) && (1..=1000).contains(&rows) {
+            state
+                .session_dimensions
+                .lock()
+                .await
+                .insert(session_id.clone(), (u32::from(cols), u32::from(rows)));
+            initial_cols = Some(cols);
+            initial_rows = Some(rows);
+        }
+    }
+
+    let entry = SessionEntry {
+        id: session_id.clone(),
+        name: format!("{mux_type}: {normalized_session_name}"),
+        command: command.clone(),
+        working_dir: working_dir.clone(),
         status: "running".to_string(),
         started_at: now.clone(),
-        last_modified: now,
-        initial_cols: None,
-        initial_rows: None,
+        last_modified: now.clone(),
+        initial_cols,
+        initial_rows,
         exit_code: None,
         git_modified_count: None,
         git_added_count: None,
         git_deleted_count: None,
         git_ahead_count: None,
         git_behind_count: None,
-    });
+    };
+
+    state.sessions.lock().await.push(entry);
+    {
+        let mut outputs = state.session_outputs.lock().await;
+        outputs.entry(session_id.clone()).or_default();
+    }
+
+    if let Err(error) = spawn_local_session_process(&state, &session_id, &command, &working_dir).await
+    {
+        state.session_dimensions.lock().await.remove(&session_id);
+        state.session_outputs.lock().await.remove(&session_id);
+
+        let mut sessions = state.sessions.lock().await;
+        if let Some(position) = sessions.iter().position(|s| s.id == session_id) {
+            sessions.remove(position);
+        }
+
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "Failed to attach to session",
+                "details": error.to_string(),
+            })),
+        )
+            .into_response();
+    }
+
+    let _title_mode = payload.title_mode;
+
+    let command_text = command.join(" ");
+    let event_payload = serde_json::to_vec(&serde_json::json!({
+        "type": "session-start",
+        "sessionId": session_id,
+        "sessionName": format!("{mux_type}: {normalized_session_name}"),
+        "command": command_text,
+        "timestamp": now,
+    }))
+    .unwrap_or_default();
+    broadcast_to_session(&state, "", WsV3MessageType::Event, event_payload).await;
 
     Json(serde_json::json!({
         "success": true,
@@ -5712,11 +6073,37 @@ async fn api_multiplexer_kill_session(
     State(state): State<AppState>,
     AxumPath((mux_type, session_name)): AxumPath<(String, String)>,
 ) -> impl IntoResponse {
-    let mut mux = state.multiplexer_state.lock().await;
-    let target_list = match mux_type.as_str() {
-        "tmux" => &mut mux.tmux,
-        "zellij" => &mut mux.zellij,
-        "screen" => &mut mux.screen,
+    if !multiplexer_available(&mux_type) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": format!("{mux_type} is not available") })),
+        )
+            .into_response();
+    }
+
+    let effective_session_name = if mux_type == "screen" {
+        resolve_screen_session_name(&session_name).unwrap_or_else(|| session_name.clone())
+    } else {
+        session_name.clone()
+    };
+
+    let kill_args: Vec<String> = match mux_type.as_str() {
+        "tmux" => vec![
+            "kill-session".to_string(),
+            "-t".to_string(),
+            effective_session_name.clone(),
+        ],
+        "zellij" => vec![
+            "delete-session".to_string(),
+            "--force".to_string(),
+            effective_session_name.clone(),
+        ],
+        "screen" => vec![
+            "-S".to_string(),
+            effective_session_name.clone(),
+            "-X".to_string(),
+            "quit".to_string(),
+        ],
         _ => {
             return (
                 StatusCode::BAD_REQUEST,
@@ -5726,14 +6113,44 @@ async fn api_multiplexer_kill_session(
         }
     };
 
-    let before = target_list.len();
-    target_list.retain(|s| s.name != session_name);
-    if target_list.len() == before {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": "Session not found" })),
-        )
-            .into_response();
+    let command_name = if mux_type == "screen" {
+        "screen"
+    } else {
+        mux_type.as_str()
+    };
+    match ProcessCommand::new(command_name).args(&kill_args).output() {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let message = if stderr.is_empty() {
+                "Failed to kill session".to_string()
+            } else {
+                stderr
+            };
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": message })),
+            )
+                .into_response();
+        }
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("Failed to kill session: {error}") })),
+            )
+                .into_response();
+        }
+    }
+
+    {
+        let mut mux = state.multiplexer_state.lock().await;
+        let target_list = match mux_type.as_str() {
+            "tmux" => &mut mux.tmux,
+            "zellij" => &mut mux.zellij,
+            "screen" => &mut mux.screen,
+            _ => unreachable!(),
+        };
+        target_list.retain(|s| s.name != effective_session_name);
     }
 
     Json(serde_json::json!({ "success": true })).into_response()
@@ -5775,8 +6192,19 @@ async fn api_multiplexer_kill_pane(
 }
 
 async fn api_multiplexer_context() -> impl IntoResponse {
+    let mut available = Vec::new();
+    if multiplexer_available("tmux") {
+        available.push("tmux");
+    }
+    if multiplexer_available("zellij") {
+        available.push("zellij");
+    }
+    if multiplexer_available("screen") {
+        available.push("screen");
+    }
+
     Json(serde_json::json!({
-        "available": ["tmux", "zellij", "screen"],
+        "available": available,
         "default": "tmux",
         "mode": "local",
     }))
