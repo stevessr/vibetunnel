@@ -14,8 +14,8 @@
  * @listens browser-cancel - From file browser when cancelled
  */
 import { html, LitElement, type PropertyValues } from 'lit';
-import { keyed } from 'lit/directives/keyed.js';
 import { customElement, property } from 'lit/decorators.js';
+import { keyed } from 'lit/directives/keyed.js';
 import type { Session } from '../../shared/types.js';
 import './clickable-path.js';
 import './session-view/session-header.js';
