@@ -107,8 +107,23 @@
     <script>
       // Check if mobile device
       // NOTE: This detection logic must match detectMobile() in src/client/utils/mobile-utils.ts
-      const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent) || 
-                       (navigator.maxTouchPoints && navigator.maxTouchPoints > 1);
+      const deviceModePreference = (() => {
+        try {
+          const mode = localStorage.getItem('vibetunnel_device_mode');
+          return mode === 'mobile' || mode === 'desktop' || mode === 'auto' ? mode : 'auto';
+        } catch {
+          return 'auto';
+        }
+      })();
+
+      const isMobileByUA = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent) ||
+        (navigator.maxTouchPoints && navigator.maxTouchPoints > 1) ||
+        (window.matchMedia && window.matchMedia('(pointer: coarse)').matches);
+
+      const isMobile =
+        deviceModePreference === 'mobile' ? true :
+        deviceModePreference === 'desktop' ? false :
+        isMobileByUA;
 
       // Handle viewport height - set only once on mobile to prevent resize loops
       function setViewportHeight() {

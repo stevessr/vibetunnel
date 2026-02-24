@@ -11,6 +11,11 @@ import {
 import { RepositoryService } from '../services/repository-service.js';
 import { ServerConfigService } from '../services/server-config-service.js';
 import { createLogger } from '../utils/logger.js';
+import {
+  type DeviceMode,
+  getDeviceModePreference,
+  setDeviceModePreference,
+} from '../utils/mobile-utils.js';
 import { VERSION } from '../version.js';
 
 const logger = createLogger('settings');
@@ -37,6 +42,7 @@ export class Settings extends LitElement {
   @state() private repositoryBasePath = DEFAULT_REPOSITORY_BASE_PATH;
   @state() private repositoryCount = 0;
   @state() private isDiscoveringRepositories = false;
+  @state() private deviceModePreference: DeviceMode = 'auto';
 
   private permissionChangeUnsubscribe?: () => void;
   private subscriptionChangeUnsubscribe?: () => void;
@@ -46,6 +52,7 @@ export class Settings extends LitElement {
   connectedCallback() {
     super.connectedCallback();
     this.initializeNotifications();
+    this.deviceModePreference = getDeviceModePreference();
     this.loadSettings();
 
     // Initialize services
@@ -210,6 +217,18 @@ export class Settings extends LitElement {
 
   private handleClose() {
     this.dispatchEvent(new CustomEvent('close'));
+  }
+
+  private handleDeviceModePreferenceChange(mode: DeviceMode) {
+    this.deviceModePreference = mode;
+    setDeviceModePreference(mode);
+    this.dispatchEvent(
+      new CustomEvent('device-mode-changed', {
+        detail: { mode },
+        bubbles: true,
+        composed: true,
+      })
+    );
   }
 
   private handleBackdropClick(e: Event) {
@@ -689,6 +708,48 @@ export class Settings extends LitElement {
       <div class="space-y-4">
         <h3 class="text-md font-bold text-primary mb-3">Application</h3>
         
+        <!-- Device Mode -->
+        <div class="p-4 bg-bg-tertiary rounded-lg border border-border/50">
+          <div class="mb-3">
+            <label class="text-primary font-medium">Device Mode</label>
+            <p class="text-muted text-xs mt-1">
+              Auto uses UA detection. You can force desktop or mobile mode.
+            </p>
+          </div>
+          <div class="flex gap-2">
+            <button
+              @click=${() => this.handleDeviceModePreferenceChange('auto')}
+              class="px-3 py-2 text-xs rounded border transition-colors ${
+                this.deviceModePreference === 'auto'
+                  ? 'bg-primary text-white border-primary'
+                  : 'bg-bg text-text-muted border-border hover:text-primary'
+              }"
+            >
+              Auto
+            </button>
+            <button
+              @click=${() => this.handleDeviceModePreferenceChange('desktop')}
+              class="px-3 py-2 text-xs rounded border transition-colors ${
+                this.deviceModePreference === 'desktop'
+                  ? 'bg-primary text-white border-primary'
+                  : 'bg-bg text-text-muted border-border hover:text-primary'
+              }"
+            >
+              Desktop
+            </button>
+            <button
+              @click=${() => this.handleDeviceModePreferenceChange('mobile')}
+              class="px-3 py-2 text-xs rounded border transition-colors ${
+                this.deviceModePreference === 'mobile'
+                  ? 'bg-primary text-white border-primary'
+                  : 'bg-bg text-text-muted border-border hover:text-primary'
+              }"
+            >
+              Mobile
+            </button>
+          </div>
+        </div>
+
         <!-- Repository Base Path -->
         <div class="p-4 bg-bg-tertiary rounded-lg border border-border/50">
           <div class="mb-3">

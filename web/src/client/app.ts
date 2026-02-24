@@ -13,7 +13,7 @@ import { isBrowserShortcut } from './utils/browser-shortcuts.js';
 import { BREAKPOINTS, SIDEBAR, TIMING, TRANSITIONS, Z_INDEX } from './utils/constants.js';
 // Import logger
 import { createLogger } from './utils/logger.js';
-import { isIOS } from './utils/mobile-utils.js';
+import { detectMobile, isIOS } from './utils/mobile-utils.js';
 import { type MediaQueryState, responsiveObserver } from './utils/responsive-utils.js';
 import { triggerTerminalResize } from './utils/terminal-utils.js';
 import { titleManager } from './utils/title-manager.js';
@@ -1215,7 +1215,7 @@ export class VibeTunnelApp extends LitElement {
   private loadSidebarState(): boolean {
     try {
       const saved = localStorage.getItem('sidebarCollapsed');
-      const isMobile = window.innerWidth < BREAKPOINTS.MOBILE;
+      const isMobile = detectMobile();
 
       // Respect saved state if it exists, otherwise default based on device type
       const result = saved !== null ? saved === 'true' : isMobile;
@@ -1232,7 +1232,7 @@ export class VibeTunnelApp extends LitElement {
       return result;
     } catch (error) {
       logger.error('error loading sidebar state:', error);
-      return window.innerWidth < BREAKPOINTS.MOBILE; // Default based on screen size on error
+      return detectMobile(); // Default based on device mode on error
     }
   }
 
@@ -1519,6 +1519,11 @@ export class VibeTunnelApp extends LitElement {
 
   private handleCloseSettings = () => {
     this.showSettings = false;
+  };
+
+  private handleDeviceModeChanged = () => {
+    responsiveObserver.refresh();
+    this.requestUpdate();
   };
 
   private handleOpenFileBrowser = () => {
@@ -1904,6 +1909,7 @@ export class VibeTunnelApp extends LitElement {
         .visible=${this.showSettings}
         .authClient=${authClient}
         @close=${this.handleCloseSettings}
+        @device-mode-changed=${this.handleDeviceModeChanged}
         @notifications-enabled=${() => {
           this.showSuccess('Notifications enabled');
         }}

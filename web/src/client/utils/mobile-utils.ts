@@ -3,18 +3,47 @@
  * Provides consistent mobile detection across the application
  */
 
-/**
- * Detect if the current device is a mobile device (phone or tablet).
- * Uses the same logic as index.html for consistency.
- *
- * @returns true if the device is mobile (iPhone, iPad, iPod, Android)
- */
-export function detectMobile(): boolean {
+export type DeviceMode = 'auto' | 'mobile' | 'desktop';
+
+const DEVICE_MODE_STORAGE_KEY = 'vibetunnel_device_mode';
+
+export function getDeviceModePreference(): DeviceMode {
+  try {
+    const value = localStorage.getItem(DEVICE_MODE_STORAGE_KEY);
+    if (value === 'mobile' || value === 'desktop' || value === 'auto') {
+      return value;
+    }
+  } catch {
+    // ignore localStorage access errors
+  }
+  return 'auto';
+}
+
+export function setDeviceModePreference(mode: DeviceMode): void {
+  try {
+    localStorage.setItem(DEVICE_MODE_STORAGE_KEY, mode);
+  } catch {
+    // ignore localStorage access errors
+  }
+}
+
+function detectMobileByUA(): boolean {
   return (
     /iPhone|iPad|iPod|Android/i.test(navigator.userAgent) ||
     (!!navigator.maxTouchPoints && navigator.maxTouchPoints > 1) ||
     window.matchMedia?.('(pointer: coarse)').matches
   );
+}
+
+/**
+ * Detect if the current device should be treated as mobile.
+ * Honors explicit user override first, then falls back to UA/capability detection.
+ */
+export function detectMobile(): boolean {
+  const preference = getDeviceModePreference();
+  if (preference === 'mobile') return true;
+  if (preference === 'desktop') return false;
+  return detectMobileByUA();
 }
 
 /**

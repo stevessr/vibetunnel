@@ -1483,7 +1483,7 @@ export class SessionView extends LitElement {
                   .terminalFontSize=${uiState.terminalFontSize}
                   .terminalMaxCols=${uiState.terminalMaxCols}
                   .terminalTheme=${uiState.terminalTheme}
-                  .disableClick=${uiState.isMobile}
+                  .disableClick=${false}
                   .hideScrollButton=${uiState.showQuickKeys}
                   .isMobile=${uiState.isMobile}
                   .showQuickKeys=${uiState.showQuickKeys}

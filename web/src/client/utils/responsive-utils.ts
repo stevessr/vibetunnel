@@ -1,4 +1,4 @@
-import { BREAKPOINTS } from './constants.js';
+import { detectMobile, getDeviceModePreference } from './mobile-utils.js';
 
 export interface MediaQueryState {
   isMobile: boolean;
@@ -57,11 +57,37 @@ export class ResponsiveObserver {
   }
 
   private getMediaQueryState(): MediaQueryState {
-    const width = window.innerWidth;
+    const modePreference = getDeviceModePreference();
+
+    if (modePreference === 'mobile') {
+      return {
+        isMobile: true,
+        isTablet: false,
+        isDesktop: false,
+      };
+    }
+
+    if (modePreference === 'desktop') {
+      return {
+        isMobile: false,
+        isTablet: false,
+        isDesktop: true,
+      };
+    }
+
+    const isMobile = detectMobile();
+    if (isMobile) {
+      return {
+        isMobile: true,
+        isTablet: false,
+        isDesktop: false,
+      };
+    }
+
     return {
-      isMobile: width < BREAKPOINTS.MOBILE,
-      isTablet: width >= BREAKPOINTS.MOBILE && width < BREAKPOINTS.DESKTOP,
-      isDesktop: width >= BREAKPOINTS.DESKTOP,
+      isMobile: false,
+      isTablet: false,
+      isDesktop: true,
     };
   }
 
@@ -92,6 +118,14 @@ export class ResponsiveObserver {
 
   getCurrentState(): MediaQueryState {
     return { ...this.currentState };
+  }
+
+  refresh(): void {
+    const newState = this.getMediaQueryState();
+    if (this.hasStateChanged(this.currentState, newState)) {
+      this.currentState = newState;
+      this.notifyCallbacks(newState);
+    }
   }
 
   destroy(): void {

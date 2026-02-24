@@ -10,6 +10,7 @@ import { clearCharacterWidthCache } from '../../utils/cursor-position.js';
 import { consumeEvent } from '../../utils/event-utils.js';
 import { isIMEAllowedKey } from '../../utils/ime-constants.js';
 import { createLogger } from '../../utils/logger.js';
+import { detectMobile, getDeviceModePreference } from '../../utils/mobile-utils.js';
 import { type LifecycleEventManagerCallbacks, ManagerEventEmitter } from './interfaces.js';
 
 // Extend Window interface to include our custom property
@@ -42,14 +43,6 @@ export class LifecycleEventManager extends ManagerEventEmitter {
   private viewportTrackingHandler: (() => void) | null = null;
   private viewportTrackingTarget: 'visual' | 'window' | null = null;
   private clickHandler: (() => void) | null = null;
-
-  // Touch detection results cache
-  private touchCapabilityCache: {
-    hasTouch: boolean;
-    isCoarsePointer: boolean;
-    hasFinePointer: boolean;
-    hasHover: boolean;
-  } | null = null;
 
   constructor() {
     super();
@@ -113,49 +106,19 @@ export class LifecycleEventManager extends ManagerEventEmitter {
   }
 
   /**
-   * Detect touch capabilities using multiple signals
-   */
-  private detectTouchCapabilities() {
-    if (this.touchCapabilityCache) {
-      return this.touchCapabilityCache;
-    }
-
-    const hasTouch =
-      'ontouchstart' in window ||
-      navigator.maxTouchPoints > 0 ||
-      ((navigator as Navigator & { msMaxTouchPoints?: number }).msMaxTouchPoints ?? 0) > 0 ||
-      window.matchMedia?.('(any-pointer: coarse)').matches === true;
-
-    const isCoarsePointer = window.matchMedia('(any-pointer: coarse)').matches;
-    const hasFinePointer = window.matchMedia('(any-pointer: fine)').matches;
-    const hasHover = window.matchMedia('(any-hover: hover)').matches;
-
-    this.touchCapabilityCache = {
-      hasTouch,
-      isCoarsePointer,
-      hasFinePointer,
-      hasHover,
-    };
-
-    logger.log('Touch capabilities detected:', this.touchCapabilityCache);
-    return this.touchCapabilityCache;
-  }
-
-  /**
    * Determine if touch keyboard should be enabled based on capabilities and preferences
    */
   private shouldEnableTouchKeyboard(): boolean {
-    // FIRST: Check if this is an iPad - always enable for iPads
-    const userAgent = navigator.userAgent;
-    const isIPadUserAgent =
-      /iPad/.test(userAgent) || (/Macintosh/.test(userAgent) && navigator.maxTouchPoints > 1);
-
-    if (isIPadUserAgent) {
-      logger.log('iPad detected via user agent - enabling touch keyboard');
+    // Respect explicit device mode first.
+    const modePreference = getDeviceModePreference();
+    if (modePreference === 'desktop') {
+      return false;
+    }
+    if (modePreference === 'mobile') {
       return true;
     }
 
-    // Get user preference from localStorage
+    // Keep manual touch keyboard override support.
     const preference = localStorage.getItem('touchKeyboardPreference') || 'auto';
 
     if (preference === 'always') {
@@ -166,31 +129,14 @@ export class LifecycleEventManager extends ManagerEventEmitter {
       return false;
     }
 
-    // Auto mode: use smart detection
-    const capabilities = this.detectTouchCapabilities();
-
-    // Touch-first devices: has touch + coarse pointer + no hover
-    const isTouchFirst =
-      capabilities.hasTouch && capabilities.isCoarsePointer && !capabilities.hasHover;
-
-    // Hybrid devices: has both touch and fine pointer (Surface, iPad with trackpad, etc)
-    const isHybrid = capabilities.hasTouch && capabilities.hasFinePointer;
-
-    // For hybrid devices, also check screen size
-    const screenSize = Math.min(window.innerWidth, window.innerHeight);
-    const isSmallScreen = screenSize < 1024;
-
-    // Enable for touch-first OR hybrid with small screen
-    const result = isTouchFirst || (isHybrid && isSmallScreen);
+    // Auto mode now follows unified mobile detection (UA/capability based).
+    const result = detectMobile();
 
     logger.log('shouldEnableTouchKeyboard:', {
       result,
-      isTouchFirst,
-      isHybrid,
-      isSmallScreen,
-      isIPadUserAgent,
-      userAgent,
-      capabilities,
+      modePreference,
+      preference,
+      userAgent: navigator.userAgent,
     });
 
     return result;
@@ -203,13 +149,8 @@ export class LifecycleEventManager extends ManagerEventEmitter {
     if (!this.callbacks) return;
 
     const shouldEnableTouchKeyboard = this.shouldEnableTouchKeyboard();
-    const capabilities = this.detectTouchCapabilities();
-
-    // Update device type based on screen size for layout purposes
-    const screenWidth = window.innerWidth;
-    const isTablet = capabilities.hasTouch && screenWidth >= 768;
-    const isPhone = capabilities.hasTouch && screenWidth < 768;
-    window.__deviceType = isTablet ? 'tablet' : isPhone ? 'phone' : 'desktop';
+    // Device mode follows unified override-aware mobile detection.
+    window.__deviceType = shouldEnableTouchKeyboard ? 'phone' : 'desktop';
 
     // Update mobile status
     const wasMobile = this.callbacks.getIsMobile();
@@ -233,9 +174,6 @@ export class LifecycleEventManager extends ManagerEventEmitter {
 
     // Clear character width cache when window is resized (may affect font rendering)
     clearCharacterWidthCache();
-
-    // Clear cache to re-evaluate capabilities (in case of device mode changes in dev tools)
-    this.touchCapabilityCache = null;
 
     // Update mobile status
     this.updateMobileStatus();
@@ -381,13 +319,8 @@ export class LifecycleEventManager extends ManagerEventEmitter {
 
     // Use new touch detection logic
     const shouldEnableTouchKeyboard = this.shouldEnableTouchKeyboard();
-    const capabilities = this.detectTouchCapabilities();
-
-    // Update device type based on screen size for layout purposes
-    const screenWidth = window.innerWidth;
-    const isTablet = capabilities.hasTouch && screenWidth >= 768;
-    const isPhone = capabilities.hasTouch && screenWidth < 768;
-    window.__deviceType = isTablet ? 'tablet' : isPhone ? 'phone' : 'desktop';
+    // Device mode follows unified override-aware mobile detection.
+    window.__deviceType = shouldEnableTouchKeyboard ? 'phone' : 'desktop';
 
     this.callbacks.setIsMobile(shouldEnableTouchKeyboard);
 
