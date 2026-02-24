@@ -62,6 +62,7 @@ export class Terminal extends LitElement {
   private terminal: GhosttyTerminal | null = null;
   private fitAddon: FitAddon | null = null;
   private resizeObserver: ResizeObserver | null = null;
+  private fallbackResizeObserver: ResizeObserver | null = null;
   private themeObserver: MutationObserver | null = null;
   private pasteInput: HTMLTextAreaElement | null = null;
   private pendingOutput = '';
@@ -75,6 +76,7 @@ export class Terminal extends LitElement {
 
   private pendingResizeSource: string | null = null;
   private pendingResizePrev: { cols: number; rows: number } | null = null;
+  private lastContainerWidth = 0;
 
   connectedCallback() {
     const prefs = TerminalPreferencesManager.getInstance();
@@ -266,6 +268,9 @@ export class Terminal extends LitElement {
   private cleanup() {
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
+    this.fallbackResizeObserver?.disconnect();
+    this.fallbackResizeObserver = null;
+    this.lastContainerWidth = 0;
     this.oscCarry = '';
 
     this.terminal?.dispose();
@@ -330,12 +335,8 @@ export class Terminal extends LitElement {
 
   private computeConstrainedCols(proposedCols: number): number {
     const calculatedCols = Math.max(20, Math.floor(proposedCols));
-    const isTunneledSession = this.sessionId.startsWith('fwd_');
 
     if (this.maxCols > 0) return Math.min(calculatedCols, this.maxCols);
-    if (this.userOverrideWidth) return calculatedCols;
-    if (this.initialCols > 0 && isTunneledSession)
-      return Math.min(calculatedCols, this.initialCols);
     return calculatedCols;
   }
 
@@ -343,21 +344,42 @@ export class Terminal extends LitElement {
     if (!this.terminal || !this.fitAddon) return;
     this.detectMobile();
 
+    const containerWidth = this.container?.clientWidth || 0;
+    const containerHeight = this.container?.clientHeight || 0;
+    if (containerWidth <= 0 || containerHeight <= 0) return;
+
     if (this.fitHorizontally) {
       this.applyHorizontalFit();
     }
 
     const proposed = this.fitAddon.proposeDimensions();
-    if (!proposed) return;
 
-    let cols = this.computeConstrainedCols(proposed.cols);
-    const rows = Math.max(6, Math.floor(proposed.rows));
+    let cols: number;
+    let rows: number;
 
+    if (proposed && Number.isFinite(proposed.cols) && Number.isFinite(proposed.rows)) {
+      cols = this.computeConstrainedCols(proposed.cols);
+      rows = Math.max(10, Math.floor(proposed.rows));
+    } else {
+      const renderer = this.terminal.renderer;
+      const metrics = renderer?.getMetrics();
+      const charWidth = Math.max(1, metrics?.width || renderer?.charWidth || 9);
+      const lineHeight = Math.max(
+        1,
+        metrics?.height || renderer?.charHeight || this.fontSize * 1.2 || 18
+      );
+
+      cols = this.computeConstrainedCols(Math.floor(containerWidth / charWidth));
+      rows = Math.max(10, Math.floor(containerHeight / lineHeight));
+    }
+
+    const widthChanged = containerWidth !== this.lastContainerWidth;
     if (
       this.isMobile &&
       this.mobileWidthResizeComplete &&
       !this.userOverrideWidth &&
-      this.lastCols
+      this.lastCols &&
+      !widthChanged
     ) {
       cols = this.lastCols;
     }
@@ -365,10 +387,15 @@ export class Terminal extends LitElement {
     const prevCols = this.lastCols || this.terminal.cols;
     const prevRows = this.lastRows || this.terminal.rows;
 
-    if (cols === prevCols && rows === prevRows) return;
+    if (cols === prevCols && rows === prevRows) {
+      this.lastContainerWidth = containerWidth;
+      return;
+    }
 
     this.requestResizeMeta(source);
     this.terminal.resize(cols, rows);
+
+    this.lastContainerWidth = containerWidth;
 
     if (this.isMobile) this.mobileWidthResizeComplete = true;
   }
@@ -464,6 +491,12 @@ export class Terminal extends LitElement {
       // Observe container resizes
       this.resizeObserver = new ResizeObserver(() => this.requestResize('resize-observer'));
       this.resizeObserver.observe(this.container);
+
+      // Also observe host size changes in case parent layout changes don't resize inner container immediately.
+      this.fallbackResizeObserver = new ResizeObserver(() =>
+        this.requestResize('host-resize-observer')
+      );
+      this.fallbackResizeObserver.observe(this);
     } catch (error) {
       logger.error('failed to initialize ghostty terminal', error);
     }
