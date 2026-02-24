@@ -72,6 +72,9 @@ export class TerminalChatView extends LitElement {
       color: #ffffff;
       font-family: inherit;
       font-size: 16px; /* Prevent zoom on iOS */
+      font-variant-ligatures: none;
+      letter-spacing: 0;
+      line-height: 1.5;
       outline: none;
       -webkit-user-select: text;
       user-select: text;
@@ -82,7 +85,7 @@ export class TerminalChatView extends LitElement {
 
     .chat-input:focus {
       border-color: #00a884;
-      background-color: rgb(50 55 60);
+      background-color: transparent;
       box-shadow: 0 0 0 2px rgba(0, 168, 132, 0.2);
     }
 
@@ -111,6 +114,9 @@ export class TerminalChatView extends LitElement {
       text-overflow: clip;
       font-size: 16px;
       font-family: inherit;
+      font-variant-ligatures: none;
+      letter-spacing: 0;
+      line-height: 1.5;
       z-index: 1;
     }
 
@@ -416,6 +422,7 @@ export class TerminalChatView extends LitElement {
   @state() private messages: ChatMessage[] = [];
   @state() private chatInputValue = '';
   @state() private inputSuggestion = '';
+  @state() private suppressEchoUntilInputChange = false;
 
   @query('#chat-input-field')
   private inputElement!: HTMLInputElement;
@@ -502,6 +509,7 @@ export class TerminalChatView extends LitElement {
         this.outputLineBuffer = '';
         this.carriageReturnPending = false;
         this.inputSuggestion = '';
+        this.suppressEchoUntilInputChange = false;
 
         // Priority: pendingInput only
         if (this.pendingInput && this.inputElement) {
@@ -534,6 +542,7 @@ export class TerminalChatView extends LitElement {
         this.carriageReturnPending = false;
         this.chatInputValue = '';
         this.inputSuggestion = '';
+        this.suppressEchoUntilInputChange = false;
         if (this.inputElement) {
           this.inputElement.value = '';
         }
@@ -577,6 +586,16 @@ export class TerminalChatView extends LitElement {
 
       // Keep prompt/autocomplete lines visible in chat; only drop exact current input echo.
       if (currentInput && line.trim() === currentInput) return;
+
+      // After accepting autosuggestion with ArrowRight, fish often echoes the accepted line.
+      // That line is input UI state, not terminal output for chat transcript.
+      if (
+        this.suppressEchoUntilInputChange &&
+        this.lastSentValue &&
+        (line.trim() === this.lastSentValue || line.trim().endsWith(this.lastSentValue))
+      ) {
+        return;
+      }
 
       // Filter TUI noise (boxes, status bars, spinners)
       if (this.isNoiseLine(line)) return;
@@ -892,27 +911,60 @@ export class TerminalChatView extends LitElement {
     const cleanChunk = this.stripAnsiCodes(rawChunk);
     if (!cleanChunk) return;
 
-    const lines = cleanChunk.split(/\r?\n/).map((line) => this.applyBackspaces(line));
+    const normalizedChunk = this.applyBackspaces(cleanChunk);
+    const segments = normalizedChunk
+      .split(/[\r\n]+/)
+      .map((segment) => segment.trimEnd())
+      .filter((segment) => segment.length > 0);
 
-    // Find the most plausible fish autosuggestion line that starts with current input.
-    for (let i = lines.length - 1; i >= 0; i--) {
-      const line = lines[i].replace(/\r+/g, '').trimEnd();
-      if (!line) continue;
-      if (!line.startsWith(baseInput)) continue;
-      if (line === baseInput) continue;
+    // Find the most plausible fish autosuggestion line containing current input.
+    for (let i = segments.length - 1; i >= 0; i--) {
+      const segment = segments[i];
+      const withoutPrompt = segment.replace(/^[\s]*[❯➜$#%>]+\s*/, '');
 
-      // Remove obvious prompts before comparison
-      const withoutPrompt = line.replace(/^[\s]*[❯➜$#%>]+\s*/, '');
-      if (!withoutPrompt.startsWith(baseInput)) continue;
+      for (const candidateLine of [withoutPrompt, segment]) {
+        const index = candidateLine.lastIndexOf(baseInput);
+        if (index === -1) continue;
 
-      this.inputSuggestion = withoutPrompt;
-      return;
+        const candidate = candidateLine.slice(index).trimEnd();
+        if (!candidate.startsWith(baseInput)) continue;
+        if (candidate === baseInput) continue;
+        if (candidate.length > baseInput.length + 256) continue;
+
+        this.inputSuggestion = candidate;
+        return;
+      }
     }
 
     // Keep previous suggestion unless a hard mismatch is detected.
     if (this.inputSuggestion && !this.inputSuggestion.startsWith(baseInput)) {
       this.inputSuggestion = '';
     }
+  }
+
+  private applySuggestionToInput(): void {
+    if (!this.inputSuggestion || !this.chatInputValue) return;
+    if (!this.inputSuggestion.startsWith(this.chatInputValue)) return;
+
+    const accepted = this.inputSuggestion;
+
+    this.chatInputValue = accepted;
+    if (this.inputElement) {
+      this.inputElement.value = accepted;
+      this.inputElement.setSelectionRange(accepted.length, accepted.length);
+    }
+
+    // Apply fish autosuggestion using terminal-native behavior (Right Arrow),
+    // so chat input and real shell buffer stay in sync.
+    this.onSend?.('\u001b[C');
+
+    // Treat accepted suggestion as already typed locally and sent to terminal.
+    this.lastSentValue = accepted;
+    this.onPendingInputChange?.(accepted);
+    this.inputSuggestion = '';
+
+    // fish usually echoes the accepted command line once; keep that out of chat messages.
+    this.suppressEchoUntilInputChange = true;
   }
 
   private addMessage(type: ChatMessage['type'], content: string) {
@@ -1299,6 +1351,14 @@ export class TerminalChatView extends LitElement {
   }
 
   private handleInputKeydown(e: KeyboardEvent) {
+    if (e.key === 'ArrowRight' && !e.shiftKey && !e.altKey && !e.ctrlKey && !e.metaKey) {
+      if (this.inputSuggestion?.startsWith(this.chatInputValue)) {
+        e.preventDefault();
+        this.applySuggestionToInput();
+        return;
+      }
+    }
+
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       this.handleSend();
@@ -1321,6 +1381,7 @@ export class TerminalChatView extends LitElement {
 
     const newValue = input.value;
     this.chatInputValue = newValue;
+    this.suppressEchoUntilInputChange = false;
 
     if (this.inputSuggestion && !this.inputSuggestion.startsWith(newValue)) {
       this.inputSuggestion = '';

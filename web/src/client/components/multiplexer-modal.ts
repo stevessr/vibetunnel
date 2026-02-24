@@ -63,9 +63,31 @@ export class MultiplexerModal extends LitElement {
     this.loading = true;
     this.error = null;
 
+    const withTimeout = <T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> => {
+      return new Promise<T>((resolve, reject) => {
+        const timer = window.setTimeout(() => {
+          reject(new Error(`${label} timed out`));
+        }, timeoutMs);
+
+        promise
+          .then((value) => {
+            clearTimeout(timer);
+            resolve(value);
+          })
+          .catch((error) => {
+            clearTimeout(timer);
+            reject(error);
+          });
+      });
+    };
+
     try {
       // Get status of all multiplexers
-      const statusResponse = await apiClient.get<MultiplexerStatus>('/multiplexer/status');
+      const statusResponse = await withTimeout(
+        apiClient.get<MultiplexerStatus>('/multiplexer/status'),
+        5000,
+        'Loading multiplexer status'
+      );
       this.multiplexerStatus = statusResponse;
 
       // Set active tab to first available multiplexer
@@ -82,16 +104,22 @@ export class MultiplexerModal extends LitElement {
       // Load windows for tmux sessions
       this.windows.clear();
       if (statusResponse.tmux.available) {
-        for (const session of statusResponse.tmux.sessions) {
-          try {
-            const windowsResponse = await apiClient.get<{ windows: TmuxWindow[] }>(
-              `/multiplexer/tmux/sessions/${session.name}/windows`
-            );
-            this.windows.set(session.name, windowsResponse.windows);
-          } catch (error) {
-            console.error(`Failed to load windows for tmux session ${session.name}:`, error);
-          }
-        }
+        await Promise.all(
+          statusResponse.tmux.sessions.map(async (session) => {
+            try {
+              const windowsResponse = await withTimeout(
+                apiClient.get<{ windows: TmuxWindow[] }>(
+                  `/multiplexer/tmux/sessions/${session.name}/windows`
+                ),
+                2500,
+                `Loading tmux windows for ${session.name}`
+              );
+              this.windows.set(session.name, windowsResponse.windows);
+            } catch (error) {
+              console.error(`Failed to load windows for tmux session ${session.name}:`, error);
+            }
+          })
+        );
       }
     } catch (error) {
       console.error('Failed to load multiplexer status:', error);

@@ -81,7 +81,9 @@ export class KittyManager {
 
   async listSessions(): Promise<MultiplexerSession[]> {
     try {
-      const { stdout } = await execFileAsync('kitty', ['@', 'ls']);
+      const { stdout } = await execFileAsync('kitty', ['@', 'ls'], {
+        timeout: 1500,
+      });
       return this.parseKittyWindowsFromLs(stdout);
     } catch (error) {
       logger.debug('Failed to list kitty windows', { error });

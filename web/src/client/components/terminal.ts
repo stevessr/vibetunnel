@@ -65,6 +65,7 @@ export class Terminal extends LitElement {
   private pasteInput: HTMLTextAreaElement | null = null;
   private pendingOutput = '';
   private pendingFollowCursor = true;
+  private oscCarry = '';
 
   private isMobile = false;
   private mobileWidthResizeComplete = false;
@@ -165,13 +166,16 @@ export class Terminal extends LitElement {
   };
 
   public write(data: string, followCursor = true) {
+    const sanitized = this.sanitizeTerminalOutput(data);
+    if (!sanitized) return;
+
     if (!this.terminal) {
-      this.pendingOutput += data;
+      this.pendingOutput += sanitized;
       this.pendingFollowCursor = this.pendingFollowCursor && followCursor;
       return;
     }
 
-    this.terminal.write(data, () => {
+    this.terminal.write(sanitized, () => {
       if (followCursor && this.followCursorEnabled) {
         this.terminal?.scrollToBottom();
       }
@@ -261,6 +265,7 @@ export class Terminal extends LitElement {
   private cleanup() {
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
+    this.oscCarry = '';
 
     this.terminal?.dispose();
     this.terminal = null;
@@ -553,6 +558,60 @@ export class Terminal extends LitElement {
     }
 
     return false;
+  }
+
+  private sanitizeTerminalOutput(input: string): string {
+    // ghostty-web currently warns on OSC 4 palette updates from some shells/themes.
+    // Drop only OSC 4 sequences while preserving all other terminal output.
+    const source = `${this.oscCarry}${input}`;
+    this.oscCarry = '';
+
+    let output = '';
+    let i = 0;
+
+    while (i < source.length) {
+      if (source[i] === '\u001b' && source[i + 1] === ']') {
+        const sequenceStart = i;
+        i += 2;
+
+        let sequenceEnd = -1;
+        let payloadEnd = -1;
+
+        while (i < source.length) {
+          if (source[i] === '\u0007') {
+            payloadEnd = i;
+            sequenceEnd = i + 1;
+            break;
+          }
+
+          if (source[i] === '\u001b' && source[i + 1] === '\\') {
+            payloadEnd = i;
+            sequenceEnd = i + 2;
+            break;
+          }
+
+          i++;
+        }
+
+        if (sequenceEnd === -1 || payloadEnd === -1) {
+          this.oscCarry = source.slice(sequenceStart);
+          break;
+        }
+
+        const payload = source.slice(sequenceStart + 2, payloadEnd);
+        if (!payload.startsWith('4;')) {
+          output += source.slice(sequenceStart, sequenceEnd);
+        }
+
+        i = sequenceEnd;
+        continue;
+      }
+
+      output += source[i];
+      i++;
+    }
+
+    return output;
   }
 
   render() {
