@@ -74,6 +74,8 @@ export class MultiplexerModal extends LitElement {
           this.activeTab = 'zellij';
         } else if (statusResponse.screen.available) {
           this.activeTab = 'screen';
+        } else if (statusResponse.kitty.available) {
+          this.activeTab = 'kitty';
         }
       }
 
@@ -208,8 +210,8 @@ export class MultiplexerModal extends LitElement {
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, -5);
       const sessionName = `session-${timestamp}`;
 
-      if (this.activeTab === 'tmux' || this.activeTab === 'screen') {
-        // For tmux and screen, create the session first
+      if (this.activeTab === 'tmux' || this.activeTab === 'screen' || this.activeTab === 'kitty') {
+        // For tmux, screen, and kitty, create the session first
         const createResponse = await apiClient.post<{ success: boolean }>('/multiplexer/sessions', {
           type: this.activeTab,
           name: sessionName,
@@ -345,7 +347,12 @@ export class MultiplexerModal extends LitElement {
 
             ${
               status &&
-              (status.tmux.available || status.zellij.available || status.screen.available)
+              (
+                status.tmux.available ||
+                  status.zellij.available ||
+                  status.screen.available ||
+                  status.kitty.available
+              )
                 ? html`
                 <div class="flex gap-2 mb-4 border-b border-border">
                   ${
@@ -390,6 +397,20 @@ export class MultiplexerModal extends LitElement {
                     `
                       : null
                   }
+                  ${
+                    status.kitty.available
+                      ? html`
+                      <button
+                        class="px-4 py-2 border-none bg-transparent text-text-muted cursor-pointer relative transition-colors hover:text-text ${this.activeTab === 'kitty' ? 'text-primary' : ''}"
+                        @click=${() => this.switchTab('kitty')}
+                      >
+                        Kitty
+                        <span class="ml-2 text-xs px-1.5 py-0.5 bg-bg-tertiary rounded-full">${status.kitty.sessions.length}</span>
+                        ${this.activeTab === 'kitty' ? html`<div class="absolute bottom-[-1px] left-0 right-0 h-0.5 bg-primary"></div>` : ''}
+                      </button>
+                    `
+                      : null
+                  }
                 </div>
               `
                 : null
@@ -400,7 +421,10 @@ export class MultiplexerModal extends LitElement {
                 ? html`<div class="mb-4 p-3 bg-bg-tertiary rounded-lg text-text-muted text-center">Loading terminal sessions...</div>`
                 : !status
                   ? html`<div class="mb-4 p-3 bg-bg-tertiary rounded-lg text-text-muted text-center">No multiplexer status available</div>`
-                  : !status.tmux.available && !status.zellij.available && !status.screen.available
+                  : !status.tmux.available &&
+                      !status.zellij.available &&
+                      !status.screen.available &&
+                      !status.kitty.available
                     ? html`
                       <div class="text-center py-12 text-text-muted">
                         <h3 class="m-0 mb-2 text-text">No Terminal Multiplexer Available</h3>
@@ -446,7 +470,15 @@ export class MultiplexerModal extends LitElement {
                               style="cursor: ${session.type === 'tmux' ? 'pointer' : 'default'}"
                             >
                               <div class="flex-1">
-                                <div class="font-semibold text-text mb-1">${session.name}</div>
+                                <div class="font-semibold text-text mb-1">
+                                  ${
+                                    session.type === 'kitty' && session.name.startsWith('id:')
+                                      ? session.activity && !session.activity.startsWith('/')
+                                        ? `${session.activity} (${session.name})`
+                                        : session.name
+                                      : session.name
+                                  }
+                                </div>
                                 <div class="text-sm text-text-muted flex gap-4">
                                   ${
                                     session.windows !== undefined

@@ -9,6 +9,7 @@ import type { SessionCreateOptions } from '../../shared/types.js';
 import { TitleMode } from '../../shared/types.js';
 import type { PtyManager } from '../pty/pty-manager.js';
 import { createLogger } from '../utils/logger.js';
+import { KittyManager } from './kitty-manager.js';
 import { ScreenManager } from './screen-manager.js';
 import { TmuxManager } from './tmux-manager.js';
 import { ZellijManager } from './zellij-manager.js';
@@ -20,6 +21,7 @@ export class MultiplexerManager {
   private tmuxManager: TmuxManager;
   private zellijManager: ZellijManager;
   private screenManager: ScreenManager;
+  private kittyManager: KittyManager;
   private ptyManager: PtyManager;
 
   private constructor(ptyManager: PtyManager) {
@@ -27,6 +29,7 @@ export class MultiplexerManager {
     this.tmuxManager = TmuxManager.getInstance(ptyManager);
     this.zellijManager = ZellijManager.getInstance(ptyManager);
     this.screenManager = ScreenManager.getInstance();
+    this.kittyManager = KittyManager.getInstance(ptyManager);
   }
 
   static getInstance(ptyManager: PtyManager): MultiplexerManager {
@@ -40,10 +43,11 @@ export class MultiplexerManager {
    * Get available multiplexers and their sessions
    */
   async getAvailableMultiplexers(): Promise<MultiplexerStatus> {
-    const [tmuxAvailable, zellijAvailable, screenAvailable] = await Promise.all([
+    const [tmuxAvailable, zellijAvailable, screenAvailable, kittyAvailable] = await Promise.all([
       this.tmuxManager.isAvailable(),
       this.zellijManager.isAvailable(),
       this.screenManager.isAvailable(),
+      this.kittyManager.isAvailable(),
     ]);
 
     const result: MultiplexerStatus = {
@@ -60,6 +64,11 @@ export class MultiplexerManager {
       screen: {
         available: screenAvailable,
         type: 'screen' as MultiplexerType,
+        sessions: [] as MultiplexerSession[],
+      },
+      kitty: {
+        available: kittyAvailable,
+        type: 'kitty' as MultiplexerType,
         sessions: [] as MultiplexerSession[],
       },
     };
@@ -101,6 +110,18 @@ export class MultiplexerManager {
       }
     }
 
+    if (kittyAvailable) {
+      try {
+        const kittySessions = await this.kittyManager.listSessions();
+        result.kitty.sessions = kittySessions.map((session) => ({
+          ...session,
+          type: 'kitty' as MultiplexerType,
+        }));
+      } catch (error) {
+        logger.error('Failed to list kitty sessions', { error });
+      }
+    }
+
     return result;
   }
 
@@ -134,6 +155,8 @@ export class MultiplexerManager {
       // Screen expects a single command string, not an array
       const command = options?.command ? options.command.join(' ') : undefined;
       await this.screenManager.createSession(name, command);
+    } else if (type === 'kitty') {
+      await this.kittyManager.createSession(name);
     } else {
       throw new Error(`Unknown multiplexer type: ${type}`);
     }
@@ -166,6 +189,8 @@ export class MultiplexerManager {
         titleMode: options?.titleMode ?? TitleMode.STATIC,
       });
       return result.sessionId;
+    } else if (type === 'kitty') {
+      return this.kittyManager.attachToKitty(sessionName, options);
     } else {
       throw new Error(`Unknown multiplexer type: ${type}`);
     }
@@ -181,6 +206,8 @@ export class MultiplexerManager {
       await this.zellijManager.killSession(sessionName);
     } else if (type === 'screen') {
       await this.screenManager.killSession(sessionName);
+    } else if (type === 'kitty') {
+      await this.kittyManager.killSession(sessionName);
     } else {
       throw new Error(`Unknown multiplexer type: ${type}`);
     }
@@ -222,6 +249,13 @@ export class MultiplexerManager {
       const session = this.screenManager.getCurrentSession();
       if (session) {
         return { type: 'screen', session };
+      }
+    }
+
+    if (this.kittyManager.isInsideKitty()) {
+      const session = this.kittyManager.getCurrentSession();
+      if (session) {
+        return { type: 'kitty', session };
       }
     }
 

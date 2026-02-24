@@ -802,6 +802,7 @@ struct MultiplexerState {
     tmux: Vec<MultiplexerSession>,
     zellij: Vec<MultiplexerSession>,
     screen: Vec<MultiplexerSession>,
+    kitty: Vec<MultiplexerSession>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -896,6 +897,7 @@ async fn main() -> Result<()> {
             }],
             zellij: Vec::new(),
             screen: Vec::new(),
+            kitty: Vec::new(),
         })),
         remote_registry: Arc::new(Mutex::new(Vec::new())),
         git_notifications: Arc::new(Mutex::new(Vec::new())),
@@ -2259,10 +2261,83 @@ fn resolve_screen_session_name(session_name: &str) -> Option<String> {
     None
 }
 
+fn kitty_window_id_from_name(session_name: &str) -> Option<String> {
+    if let Some(id) = session_name.strip_prefix("id:") {
+        if !id.is_empty() && id.chars().all(|ch| ch.is_ascii_digit()) {
+            return Some(id.to_string());
+        }
+    }
+
+    None
+}
+
+fn list_kitty_sessions() -> Vec<MultiplexerSession> {
+    let output = match ProcessCommand::new("kitty").args(["@", "ls"]).output() {
+        Ok(output) => output,
+        Err(_) => return Vec::new(),
+    };
+
+    if !output.status.success() {
+        return Vec::new();
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed = match serde_json::from_str::<serde_json::Value>(&stdout) {
+        Ok(value) => value,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut sessions = Vec::new();
+    let Some(os_windows) = parsed.as_array() else {
+        return sessions;
+    };
+
+    for os_window in os_windows {
+        let tabs = os_window
+            .get("tabs")
+            .and_then(|tabs| tabs.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        for tab in tabs {
+            let windows = tab
+                .get("windows")
+                .and_then(|windows| windows.as_array())
+                .cloned()
+                .unwrap_or_default();
+
+            for window in windows {
+                let Some(id) = window.get("id").and_then(|value| value.as_i64()) else {
+                    continue;
+                };
+                let title = window
+                    .get("title")
+                    .and_then(|value| value.as_str())
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| format!("window-{id}"));
+
+                sessions.push(MultiplexerSession {
+                    name: format!("id:{id}"),
+                    session_type: "kitty".to_string(),
+                    current: false,
+                    attached: true,
+                    windows: 1,
+                    activity: title,
+                    exited: false,
+                });
+            }
+        }
+    }
+
+    sessions
+}
+
 fn default_multiplexer_status(state: &MultiplexerState) -> serde_json::Value {
     let tmux_available = multiplexer_available("tmux");
     let zellij_available = multiplexer_available("zellij");
     let screen_available = multiplexer_available("screen");
+    let kitty_available = multiplexer_available("kitty");
 
     let zellij_sessions = if zellij_available {
         list_zellij_sessions()
@@ -2272,6 +2347,12 @@ fn default_multiplexer_status(state: &MultiplexerState) -> serde_json::Value {
 
     let screen_sessions = if screen_available {
         list_screen_sessions()
+    } else {
+        Vec::new()
+    };
+
+    let kitty_sessions = if kitty_available {
+        list_kitty_sessions()
     } else {
         Vec::new()
     };
@@ -2291,6 +2372,11 @@ fn default_multiplexer_status(state: &MultiplexerState) -> serde_json::Value {
             "available": screen_available,
             "type": "screen",
             "sessions": screen_sessions,
+        },
+        "kitty": {
+            "available": kitty_available,
+            "type": "kitty",
+            "sessions": kitty_sessions,
         }
     })
 }
@@ -5847,6 +5933,44 @@ async fn api_multiplexer_create_session(
                     .into_response();
             }
         },
+        "kitty" => match ProcessCommand::new("kitty")
+            .args(["@", "launch", "--type=window", "--title", &name])
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                let mut mux = state.multiplexer_state.lock().await;
+                mux.kitty.retain(|s| s.name != name);
+                mux.kitty.push(MultiplexerSession {
+                    name: name.clone(),
+                    session_type: "kitty".to_string(),
+                    current: false,
+                    attached: true,
+                    windows: 1,
+                    activity: now_iso(),
+                    exited: false,
+                });
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                let message = if stderr.is_empty() {
+                    "Failed to create kitty session (is kitty remote control enabled?)".to_string()
+                } else {
+                    stderr
+                };
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": message })),
+                )
+                    .into_response();
+            }
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": format!("Failed to create kitty session: {error}") })),
+                )
+                    .into_response();
+            }
+        },
         _ => {
             return (
                 StatusCode::BAD_REQUEST,
@@ -5897,12 +6021,136 @@ async fn api_multiplexer_attach(
         session_name.clone()
     };
 
+    if mux_type == "kitty" {
+        let Some(window_id) = kitty_window_id_from_name(&normalized_session_name) else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "Kitty session must use id format: id:<window-id>",
+                })),
+            )
+                .into_response();
+        };
+
+        let command = vec![
+            "kitty".to_string(),
+            "@".to_string(),
+            "focus-window".to_string(),
+            "--match".to_string(),
+            format!("id:{window_id}"),
+        ];
+
+        let fallback_working_dir = std::env::current_dir()
+            .unwrap_or_default()
+            .display()
+            .to_string();
+        let working_dir_input = payload.working_dir.unwrap_or_default();
+        let mut working_dir = if working_dir_input.trim().is_empty() {
+            fallback_working_dir.clone()
+        } else {
+            resolve_absolute_path(&working_dir_input)
+                .to_string_lossy()
+                .to_string()
+        };
+        if !Path::new(&working_dir).is_dir() {
+            working_dir = fallback_working_dir;
+        }
+
+        let session_id = uuid_like();
+        let now = now_iso();
+
+        let mut initial_cols: Option<u16> = None;
+        let mut initial_rows: Option<u16> = None;
+        if let (Some(cols), Some(rows)) = (payload.cols, payload.rows) {
+            if (1..=1000).contains(&cols) && (1..=1000).contains(&rows) {
+                state
+                    .session_dimensions
+                    .lock()
+                    .await
+                    .insert(session_id.clone(), (u32::from(cols), u32::from(rows)));
+                initial_cols = Some(cols);
+                initial_rows = Some(rows);
+            }
+        }
+
+        let entry = SessionEntry {
+            id: session_id.clone(),
+            name: format!("kitty: id:{window_id}"),
+            command: command.clone(),
+            working_dir: working_dir.clone(),
+            status: "running".to_string(),
+            started_at: now.clone(),
+            last_modified: now.clone(),
+            initial_cols,
+            initial_rows,
+            exit_code: None,
+            git_modified_count: None,
+            git_added_count: None,
+            git_deleted_count: None,
+            git_ahead_count: None,
+            git_behind_count: None,
+        };
+
+        state.sessions.lock().await.push(entry);
+        {
+            let mut outputs = state.session_outputs.lock().await;
+            outputs.entry(session_id.clone()).or_default();
+        }
+
+        if let Err(error) =
+            spawn_local_session_process(&state, &session_id, &command, &working_dir).await
+        {
+            state.session_dimensions.lock().await.remove(&session_id);
+            state.session_outputs.lock().await.remove(&session_id);
+
+            let mut sessions = state.sessions.lock().await;
+            if let Some(position) = sessions.iter().position(|s| s.id == session_id) {
+                sessions.remove(position);
+            }
+
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "Failed to attach to kitty session",
+                    "details": error.to_string(),
+                })),
+            )
+                .into_response();
+        }
+
+        let _title_mode = payload.title_mode;
+
+        let command_text = command.join(" ");
+        let event_payload = serde_json::to_vec(&serde_json::json!({
+            "type": "session-start",
+            "sessionId": session_id,
+            "sessionName": format!("kitty: id:{window_id}"),
+            "command": command_text,
+            "timestamp": now,
+        }))
+        .unwrap_or_default();
+        broadcast_to_session(&state, "", WsV3MessageType::Event, event_payload).await;
+
+        return Json(serde_json::json!({
+            "success": true,
+            "sessionId": session_id,
+            "target": {
+                "type": mux_type,
+                "session": session_name,
+                "window": payload.window_index,
+                "pane": payload.pane_index,
+            }
+        }))
+        .into_response();
+    }
+
     {
         let mut mux = state.multiplexer_state.lock().await;
         let target_list = match mux_type.as_str() {
             "tmux" => &mut mux.tmux,
             "zellij" => &mut mux.zellij,
             "screen" => &mut mux.screen,
+            "kitty" => &mut mux.kitty,
             _ => {
                 return (
                     StatusCode::BAD_REQUEST,
@@ -6104,6 +6352,23 @@ async fn api_multiplexer_kill_session(
             "-X".to_string(),
             "quit".to_string(),
         ],
+        "kitty" => {
+            let Some(window_id) = kitty_window_id_from_name(&effective_session_name) else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "Kitty session must use id format: id:<window-id>",
+                    })),
+                )
+                    .into_response();
+            };
+            vec![
+                "@".to_string(),
+                "close-window".to_string(),
+                "--match".to_string(),
+                format!("id:{window_id}"),
+            ]
+        }
         _ => {
             return (
                 StatusCode::BAD_REQUEST,
@@ -6113,10 +6378,10 @@ async fn api_multiplexer_kill_session(
         }
     };
 
-    let command_name = if mux_type == "screen" {
-        "screen"
-    } else {
-        mux_type.as_str()
+    let command_name = match mux_type.as_str() {
+        "screen" => "screen",
+        "kitty" => "kitty",
+        _ => mux_type.as_str(),
     };
     match ProcessCommand::new(command_name).args(&kill_args).output() {
         Ok(output) if output.status.success() => {}
@@ -6148,6 +6413,7 @@ async fn api_multiplexer_kill_session(
             "tmux" => &mut mux.tmux,
             "zellij" => &mut mux.zellij,
             "screen" => &mut mux.screen,
+            "kitty" => &mut mux.kitty,
             _ => unreachable!(),
         };
         target_list.retain(|s| s.name != effective_session_name);
@@ -6201,6 +6467,9 @@ async fn api_multiplexer_context() -> impl IntoResponse {
     }
     if multiplexer_available("screen") {
         available.push("screen");
+    }
+    if multiplexer_available("kitty") {
+        available.push("kitty");
     }
 
     Json(serde_json::json!({

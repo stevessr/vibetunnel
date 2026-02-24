@@ -788,6 +788,13 @@ export class SessionView extends LitElement {
     this.updateTerminalTransform();
   };
 
+  private async handleSpecialKey(key: string) {
+    if (!this.inputManager) return;
+
+    const normalizedKey = key === '\t' ? 'tab' : key;
+    await this.inputManager.sendInput(normalizedKey);
+  }
+
   private handleTerminalClick(e: Event) {
     const uiState = this.uiStateManager.getState();
     if (uiState.isMobile) {
