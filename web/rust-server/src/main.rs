@@ -6286,19 +6286,19 @@ async fn api_multiplexer_attach(
     let session_id = uuid_like();
     let now = now_iso();
 
-    let mut initial_cols: Option<u16> = None;
-    let mut initial_rows: Option<u16> = None;
-    if let (Some(cols), Some(rows)) = (payload.cols, payload.rows) {
-        if (1..=1000).contains(&cols) && (1..=1000).contains(&rows) {
-            state
-                .session_dimensions
-                .lock()
-                .await
-                .insert(session_id.clone(), (u32::from(cols), u32::from(rows)));
-            initial_cols = Some(cols);
-            initial_rows = Some(rows);
-        }
-    }
+    let requested_cols = payload.cols.unwrap_or(80).clamp(20, 1000);
+    let requested_rows = payload.rows.unwrap_or(24).clamp(10, 1000);
+
+    state
+        .session_dimensions
+        .lock()
+        .await
+        .insert(
+            session_id.clone(),
+            (u32::from(requested_cols), u32::from(requested_rows)),
+        );
+    let initial_cols: Option<u16> = Some(requested_cols);
+    let initial_rows: Option<u16> = Some(requested_rows);
 
     let entry = SessionEntry {
         id: session_id.clone(),
@@ -7344,19 +7344,16 @@ async fn api_create_session(
     let session_name = payload.name.unwrap_or_else(|| command.join(" "));
     let command_text = command.join(" ");
 
-    let mut initial_cols: Option<u16> = None;
-    let mut initial_rows: Option<u16> = None;
-    if let (Some(cols), Some(rows)) = (payload.cols, payload.rows) {
-        if (1..=1000).contains(&cols) && (1..=1000).contains(&rows) {
-            state
-                .session_dimensions
-                .lock()
-                .await
-                .insert(id.clone(), (u32::from(cols), u32::from(rows)));
-            initial_cols = Some(cols);
-            initial_rows = Some(rows);
-        }
-    }
+    let requested_cols = payload.cols.unwrap_or(80).clamp(20, 1000);
+    let requested_rows = payload.rows.unwrap_or(24).clamp(10, 1000);
+
+    state
+        .session_dimensions
+        .lock()
+        .await
+        .insert(id.clone(), (u32::from(requested_cols), u32::from(requested_rows)));
+    let initial_cols: Option<u16> = Some(requested_cols);
+    let initial_rows: Option<u16> = Some(requested_rows);
 
     let entry = SessionEntry {
         id: id.clone(),

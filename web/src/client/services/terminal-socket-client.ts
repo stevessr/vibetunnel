@@ -295,7 +295,9 @@ export class TerminalSocketClient {
 
   resize(sessionId: string, cols: number, rows: number): boolean {
     if (!sessionId) return false;
-    const payload = encodeWsV3ResizePayload(cols, rows);
+    const safeCols = Math.max(20, Math.min(1000, Math.floor(cols)));
+    const safeRows = Math.max(10, Math.min(1000, Math.floor(rows)));
+    const payload = encodeWsV3ResizePayload(safeCols, safeRows);
     this.sendFrame(encodeWsV3Frame({ type: WsV3MessageType.RESIZE, sessionId, payload }));
     return true;
   }
