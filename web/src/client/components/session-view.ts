@@ -733,20 +733,27 @@ export class SessionView extends LitElement {
     const currentChatMode = this.uiStateManager.getState().chatMode;
     const enteringChatMode = !currentChatMode;
 
-    if (enteringChatMode) {
-      this.uiStateManager.hideAllMobileOverlays();
-      this.uiStateManager.setUseDirectKeyboard(false);
-      this.uiStateManager.setShowMobileInput(false);
-      this.directKeyboardManager.blurHiddenInput();
-    } else {
-      this.uiStateManager.hideAllMobileOverlays();
-      this.uiStateManager.setUseDirectKeyboard(false);
-      this.uiStateManager.setShowMobileInput(false);
-      this.directKeyboardManager.blurHiddenInput();
-    }
+    this.uiStateManager.hideAllMobileOverlays();
+    this.uiStateManager.setUseDirectKeyboard(false);
+    this.uiStateManager.setShowMobileInput(false);
+    this.directKeyboardManager.blurHiddenInput();
 
     this.uiStateManager.toggleChatMode();
     this.updateTerminalTransform();
+
+    // When leaving chat mode, force a terminal refit and a resize sync immediately.
+    // This prevents TUI apps (e.g. btop) from seeing a stale/invalid PTY size.
+    if (!enteringChatMode) {
+      requestAnimationFrame(() => {
+        const terminal = this.getTerminalElement();
+        if (!terminal) return;
+
+        const terminalElement = terminal as unknown as { fitTerminal?: (source?: string) => void };
+        if (typeof terminalElement.fitTerminal === 'function') {
+          terminalElement.fitTerminal('exit-chat-mode');
+        }
+      });
+    }
   }
   private handleKeyboardButtonClick() {
     const state = this.uiStateManager.getState();
@@ -822,6 +829,12 @@ export class SessionView extends LitElement {
 
   private handleTerminalResize(event: CustomEvent<{ cols: number; rows: number }>) {
     logger.log('Terminal resized:', event.detail);
+
+    // In chat mode, keep server-side PTY size stable and ignore hidden-render resizes.
+    if (this.uiStateManager.getState().chatMode) {
+      return;
+    }
+
     this.terminalLifecycleManager.handleTerminalResize(event);
   }
 

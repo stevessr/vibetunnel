@@ -16,6 +16,9 @@ import type { ConnectionManager } from './connection-manager.js';
 import type { InputManager } from './input-manager.js';
 
 const logger = createLogger('terminal-lifecycle-manager');
+const MIN_SAFE_COLS = 20;
+const MIN_SAFE_ROWS = 6;
+const TUIS_RECOMMENDED_ROWS = 10;
 
 export interface TerminalEventHandlers {
   handleSessionExit: (e: Event) => void;
@@ -39,12 +42,27 @@ export class TerminalLifecycleManager {
   private resizeTimeout: number | null = null;
   private lastResizeWidth = 0;
   private lastResizeHeight = 0;
+  private stableCols = 0;
+  private stableRows = 0;
   private domElement: Element | null = null;
   private eventHandlers: TerminalEventHandlers | null = null;
   private stateCallbacks: TerminalStateCallbacks | null = null;
 
   setSession(session: Session | null) {
     this.session = session;
+
+    if (!session) {
+      this.stableCols = 0;
+      this.stableRows = 0;
+      return;
+    }
+
+    if (session.initialCols && session.initialCols >= MIN_SAFE_COLS) {
+      this.stableCols = session.initialCols;
+    }
+    if (session.initialRows && session.initialRows >= MIN_SAFE_ROWS) {
+      this.stableRows = session.initialRows;
+    }
   }
 
   setTerminal(terminal: Terminal | null) {
@@ -189,10 +207,39 @@ export class TerminalLifecycleManager {
       this.stateCallbacks.updateTerminalDimensions(cols, rows);
     }
 
+    // Track most recent stable dimensions for fallback use.
+    if (cols >= MIN_SAFE_COLS && rows >= MIN_SAFE_ROWS) {
+      this.stableCols = cols;
+      this.stableRows = rows;
+    }
+
+    const fallbackCols =
+      this.stableCols >= MIN_SAFE_COLS
+        ? this.stableCols
+        : this.session?.initialCols && this.session.initialCols >= MIN_SAFE_COLS
+          ? this.session.initialCols
+          : MIN_SAFE_COLS;
+    const fallbackRows =
+      this.stableRows >= MIN_SAFE_ROWS
+        ? this.stableRows
+        : this.session?.initialRows && this.session.initialRows >= TUIS_RECOMMENDED_ROWS
+          ? this.session.initialRows
+          : TUIS_RECOMMENDED_ROWS;
+
+    // Clamp unsafe dimensions to a known-good fallback rather than dropping the resize event.
+    const safeCols = cols < MIN_SAFE_COLS ? fallbackCols : cols;
+    const safeRows = rows < MIN_SAFE_ROWS ? fallbackRows : rows;
+
+    if (safeCols !== cols || safeRows !== rows) {
+      logger.debug(
+        `clamped unsafe resize ${cols}x${rows} -> ${safeCols}x${safeRows} (source: ${source})`
+      );
+    }
+
     // On mobile, skip sending height-only changes to the server (keyboard events)
     if (isMobile && isHeightOnlyChange) {
       logger.debug(
-        `skipping mobile height-only resize to server: ${cols}x${rows} (source: ${source})`
+        `skipping mobile height-only resize to server: ${safeCols}x${safeRows} (source: ${source})`
       );
       return;
     }
@@ -204,8 +251,8 @@ export class TerminalLifecycleManager {
 
     this.resizeTimeout = window.setTimeout(async () => {
       // Only send resize request if dimensions actually changed
-      if (cols === this.lastResizeWidth && rows === this.lastResizeHeight) {
-        logger.debug(`skipping redundant resize request: ${cols}x${rows}`);
+      if (safeCols === this.lastResizeWidth && safeRows === this.lastResizeHeight) {
+        logger.debug(`skipping redundant resize request: ${safeCols}x${safeRows}`);
         return;
       }
 
@@ -213,15 +260,15 @@ export class TerminalLifecycleManager {
       if (this.session && this.session.status !== 'exited') {
         try {
           logger.debug(
-            `sending resize request: ${cols}x${rows} (was ${this.lastResizeWidth}x${this.lastResizeHeight})`
+            `sending resize request: ${safeCols}x${safeRows} (was ${this.lastResizeWidth}x${this.lastResizeHeight})`
           );
 
-          const sent = terminalSocketClient.resize(this.session.id, cols, rows);
+          const sent = terminalSocketClient.resize(this.session.id, safeCols, safeRows);
           if (!sent) {
             const response = await fetch(`/api/sessions/${this.session.id}/resize`, {
               method: HttpMethod.POST,
               headers: { 'Content-Type': 'application/json', ...authClient.getAuthHeader() },
-              body: JSON.stringify({ cols: cols, rows: rows }),
+              body: JSON.stringify({ cols: safeCols, rows: safeRows }),
             });
 
             if (!response.ok) {
@@ -230,8 +277,10 @@ export class TerminalLifecycleManager {
             }
           }
 
-          this.lastResizeWidth = cols;
-          this.lastResizeHeight = rows;
+          this.lastResizeWidth = safeCols;
+          this.lastResizeHeight = safeRows;
+          this.stableCols = safeCols;
+          this.stableRows = safeRows;
         } catch (error) {
           logger.warn('failed to send resize request', error);
         }
