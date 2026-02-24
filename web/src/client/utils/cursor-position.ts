@@ -2,9 +2,10 @@
  * Shared cursor position calculation utility for terminal components
  */
 import { TERMINAL_FONT_FAMILY, TERMINAL_IDS } from './terminal-constants.js';
+import { TerminalPreferencesManager } from './terminal-preferences.js';
 
-// Cache for character width measurements per font size
-const charWidthCache = new Map<number, number>();
+// Cache for character width measurements per font size and font family
+const charWidthCache = new Map<string, number>();
 
 /**
  * Measure character width for a given font size, with caching
@@ -13,9 +14,13 @@ const charWidthCache = new Map<number, number>();
  * @returns Character width in pixels
  */
 function measureCharacterWidth(fontSize: number, container: Element): number {
+  const fontFamily =
+    TerminalPreferencesManager.getInstance().getFontFamily() || TERMINAL_FONT_FAMILY;
+  const cacheKey = `${fontSize}::${fontFamily}`;
+
   // Return cached value if available
-  if (charWidthCache.has(fontSize)) {
-    const cachedWidth = charWidthCache.get(fontSize);
+  if (charWidthCache.has(cacheKey)) {
+    const cachedWidth = charWidthCache.get(cacheKey);
     if (cachedWidth !== undefined) {
       return cachedWidth;
     }
@@ -26,7 +31,7 @@ function measureCharacterWidth(fontSize: number, container: Element): number {
   testElement.style.position = 'absolute';
   testElement.style.visibility = 'hidden';
   testElement.style.fontSize = `${fontSize}px`;
-  testElement.style.fontFamily = TERMINAL_FONT_FAMILY;
+  testElement.style.fontFamily = fontFamily;
   testElement.textContent = '0';
 
   try {
@@ -34,7 +39,7 @@ function measureCharacterWidth(fontSize: number, container: Element): number {
     const charWidth = testElement.getBoundingClientRect().width;
 
     // Cache the measurement
-    charWidthCache.set(fontSize, charWidth);
+    charWidthCache.set(cacheKey, charWidth);
     return charWidth;
   } finally {
     // Ensure cleanup even if measurement fails

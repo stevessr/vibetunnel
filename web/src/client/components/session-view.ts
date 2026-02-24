@@ -14,6 +14,7 @@
  * @listens browser-cancel - From file browser when cancelled
  */
 import { html, LitElement, type PropertyValues } from 'lit';
+import { keyed } from 'lit/directives/keyed.js';
 import { customElement, property } from 'lit/decorators.js';
 import type { Session } from '../../shared/types.js';
 import './clickable-path.js';
@@ -99,6 +100,7 @@ export class SessionView extends LitElement {
 
   private instanceId = `session-view-${Math.random().toString(36).substr(2, 9)}`;
   private _updateTerminalTransformTimeout: ReturnType<typeof setTimeout> | null = null;
+  private pendingTerminalInitTimeout: ReturnType<typeof setTimeout> | null = null;
   private terminalOutputListeners: Set<(data: string) => void> = new Set();
 
   private createLifecycleEventManagerCallbacks(): LifecycleEventManagerCallbacks {
@@ -202,6 +204,8 @@ export class SessionView extends LitElement {
       setTerminalMaxCols: (cols: number) => this.uiStateManager.setTerminalMaxCols(cols),
       setTerminalFontSize: (size: number) => this.uiStateManager.setTerminalFontSize(size),
       setTerminalTheme: (theme: TerminalThemeId) => this.uiStateManager.setTerminalTheme(theme),
+      setTerminalFontFamily: (fontFamily: string) =>
+        this.uiStateManager.setTerminalFontFamily(fontFamily),
       setShowWidthSelector: (show: boolean) => this.uiStateManager.setShowWidthSelector(show),
       setCustomWidth: (width: string) => this.uiStateManager.setCustomWidth(width),
       getTerminalLifecycleManager: () => this.terminalLifecycleManager,
@@ -390,9 +394,11 @@ export class SessionView extends LitElement {
     const maxCols = this.terminalSettingsManager.getMaxCols();
     const fontSize = this.terminalSettingsManager.getFontSize();
     const theme = this.terminalSettingsManager.getTheme();
+    const fontFamily = this.terminalSettingsManager.getFontFamily();
     this.uiStateManager.setTerminalMaxCols(maxCols);
     this.uiStateManager.setTerminalFontSize(fontSize);
     this.uiStateManager.setTerminalTheme(theme);
+    this.uiStateManager.setTerminalFontFamily(fontFamily);
     logger.debug('Loaded terminal theme:', theme);
     this.terminalLifecycleManager.setTerminalFontSize(fontSize);
     this.terminalLifecycleManager.setTerminalMaxCols(maxCols);
@@ -436,6 +442,12 @@ export class SessionView extends LitElement {
       this._updateTerminalTransformTimeout = null;
     }
 
+    // Clear any pending terminal initialization retry
+    if (this.pendingTerminalInitTimeout) {
+      clearTimeout(this.pendingTerminalInitTimeout);
+      this.pendingTerminalInitTimeout = null;
+    }
+
     // Use lifecycle event manager for teardown
     if (this.lifecycleEventManager) {
       this.lifecycleEventManager.teardownLifecycle();
@@ -474,7 +486,15 @@ export class SessionView extends LitElement {
 
     // Load terminal preferences BEFORE terminal setup to ensure proper initialization
     const terminalTheme = this.terminalSettingsManager.getTerminalTheme();
+    const terminalFontFamily = this.terminalSettingsManager.getTerminalFontFamily();
     logger.debug('Loaded terminal theme from preferences:', terminalTheme);
+
+    const terminal = this.getTerminalElement();
+    if (terminal) {
+      terminal.theme = terminalTheme;
+      terminal.fontFamily = terminalFontFamily;
+      terminal.requestUpdate();
+    }
 
     // Don't setup terminal here - wait for session data to be available
     // Terminal setup will be triggered in updated() when session becomes available
@@ -486,16 +506,40 @@ export class SessionView extends LitElement {
     // If session changed, clean up old stream connection and reset terminal state
     if (changedProperties.has('session')) {
       const oldSession = changedProperties.get('session') as Session | null;
-      const sessionChanged = oldSession?.id !== this.session?.id;
+      const oldSessionId = oldSession?.id ?? null;
+      const newSessionId = this.session?.id ?? null;
+      const sessionChanged = oldSessionId !== newSessionId;
 
-      if (sessionChanged && oldSession) {
-        logger.log('Session changed, cleaning up old stream connection');
+      if (sessionChanged) {
+        logger.log('Session changed, resetting terminal state', {
+          from: oldSessionId,
+          to: newSessionId,
+        });
+
         if (this.connectionManager) {
           this.connectionManager.cleanupStreamConnection();
+          this.connectionManager.setTerminal(null);
+          this.connectionManager.setSession(this.session);
         }
-        // Clean up terminal lifecycle manager for fresh start
+
         if (this.terminalLifecycleManager) {
           this.terminalLifecycleManager.cleanup();
+          this.terminalLifecycleManager.setTerminal(null);
+          this.terminalLifecycleManager.setSession(this.session);
+        }
+
+        // Cancel any stale deferred init from previous session switches.
+        if (this.pendingTerminalInitTimeout) {
+          clearTimeout(this.pendingTerminalInitTimeout);
+          this.pendingTerminalInitTimeout = null;
+        }
+      } else {
+        // Keep manager session references fresh for status/metadata updates.
+        if (this.connectionManager) {
+          this.connectionManager.setSession(this.session);
+        }
+        if (this.terminalLifecycleManager) {
+          this.terminalLifecycleManager.setSession(this.session);
         }
       }
 
@@ -503,16 +547,12 @@ export class SessionView extends LitElement {
       if (this.inputManager) {
         this.inputManager.setSession(this.session);
       }
-      if (this.terminalLifecycleManager) {
-        this.terminalLifecycleManager.setSession(this.session);
-      }
       if (this.lifecycleEventManager) {
         this.lifecycleEventManager.setSession(this.session);
       }
 
-      // Initialize terminal when session first becomes available
-      if (this.session && this.uiStateManager.getState().connected && !oldSession) {
-        logger.log('Session data now available, initializing terminal');
+      // Always (re)initialize when session becomes available or session id changes.
+      if (this.session && this.uiStateManager.getState().connected) {
         this.ensureTerminalInitialized();
       }
     }
@@ -553,6 +593,8 @@ export class SessionView extends LitElement {
       return;
     }
 
+    const targetSessionId = this.session.id;
+
     // Check if terminal is already initialized
     if (this.terminalLifecycleManager.getTerminal()) {
       logger.log('Terminal already initialized');
@@ -563,9 +605,25 @@ export class SessionView extends LitElement {
     const terminalElement = this.getTerminalElement();
     if (!terminalElement) {
       logger.log('Terminal element not found in DOM, deferring initialization');
-      // Retry after next render cycle with a small delay to ensure terminal-renderer has rendered
-      setTimeout(() => {
+
+      // Retry after next render cycle with a small delay to ensure terminal-renderer has rendered.
+      // Keep only one pending retry and ignore stale retries from previous session switches.
+      if (this.pendingTerminalInitTimeout) {
+        clearTimeout(this.pendingTerminalInitTimeout);
+      }
+
+      this.pendingTerminalInitTimeout = setTimeout(() => {
+        this.pendingTerminalInitTimeout = null;
+
         requestAnimationFrame(() => {
+          if (!this.session || this.session.id !== targetSessionId) {
+            logger.debug('Skipping stale terminal init retry', {
+              targetSessionId,
+              currentSessionId: this.session?.id,
+            });
+            return;
+          }
+
           this.ensureTerminalInitialized();
         });
       }, 100);
@@ -1476,23 +1534,29 @@ export class SessionView extends LitElement {
               <!-- Enhanced Terminal Component -->
               <div style="position: relative; height: 100%;">
                 <!-- Terminal (hidden when chat mode is active) -->
-                <terminal-renderer
-                  style="${uiState.chatMode ? 'display: none;' : ''}"
-                  id="${TERMINAL_IDS.SESSION_TERMINAL}"
-                  .session=${this.session}
-                  .terminalFontSize=${uiState.terminalFontSize}
-                  .terminalMaxCols=${uiState.terminalMaxCols}
-                  .terminalTheme=${uiState.terminalTheme}
-                  .disableClick=${false}
-                  .hideScrollButton=${uiState.showQuickKeys}
-                  .isMobile=${uiState.isMobile}
-                  .showQuickKeys=${uiState.showQuickKeys}
-                  .onTerminalClick=${this.boundHandleTerminalClick}
-                  .onTerminalInput=${this.boundHandleTerminalInput}
-                  .onTerminalResize=${this.boundHandleTerminalResize}
-                  .onTerminalReady=${this.boundHandleTerminalReady}
-                ></terminal-renderer>
-                
+                ${keyed(
+                  this.session?.id ?? 'no-session',
+                  html`
+                    <terminal-renderer
+                      style="${uiState.chatMode ? 'display: none;' : ''}"
+                      id="${TERMINAL_IDS.SESSION_TERMINAL}"
+                      .session=${this.session}
+                      .terminalFontSize=${uiState.terminalFontSize}
+                      .terminalMaxCols=${uiState.terminalMaxCols}
+                      .terminalTheme=${uiState.terminalTheme}
+                      .terminalFontFamily=${uiState.terminalFontFamily}
+                      .disableClick=${false}
+                      .hideScrollButton=${uiState.showQuickKeys}
+                      .isMobile=${uiState.isMobile}
+                      .showQuickKeys=${uiState.showQuickKeys}
+                      .onTerminalClick=${this.boundHandleTerminalClick}
+                      .onTerminalInput=${this.boundHandleTerminalInput}
+                      .onTerminalResize=${this.boundHandleTerminalResize}
+                      .onTerminalReady=${this.boundHandleTerminalReady}
+                    ></terminal-renderer>
+                  `
+                )}
+
                 <!-- Chat view overlay (always rendered but hidden to preserve history) -->
                 <terminal-chat-view
                   style="position: absolute; top: 0; left: 0; width: 100%; height: 100%; ${uiState.chatMode ? '' : 'display: none; pointer-events: none;'}"
@@ -1606,6 +1670,9 @@ export class SessionView extends LitElement {
                 this.terminalSettingsManager.handleFontSizeChange(size),
               onThemeChange: (theme: TerminalThemeId) =>
                 this.terminalSettingsManager.handleThemeChange(theme),
+              onFontFamilyChange: (fontFamily: string) =>
+                this.terminalSettingsManager.handleFontFamilyChange(fontFamily),
+              getTerminalFontFamily: () => this.terminalSettingsManager.getTerminalFontFamily(),
               onCloseWidthSelector: () => {
                 this.uiStateManager.setShowWidthSelector(false);
                 this.uiStateManager.setCustomWidth('');

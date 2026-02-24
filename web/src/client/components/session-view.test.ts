@@ -34,6 +34,7 @@ import type { Terminal } from './terminal';
 
 // Test interface for SessionView with access to private managers
 interface SessionViewTestInterface extends SessionView {
+  pendingTerminalInitTimeout: ReturnType<typeof setTimeout> | null;
   loadingAnimationManager: {
     isLoading: () => boolean;
     startLoading: () => void;

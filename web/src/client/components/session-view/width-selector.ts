@@ -8,6 +8,7 @@ import { html, LitElement } from 'lit';
 import { customElement, property } from 'lit/decorators.js';
 import { Z_INDEX } from '../../utils/constants.js';
 import { createLogger } from '../../utils/logger.js';
+import { TERMINAL_FONT_FAMILY } from '../../utils/terminal-constants.js';
 import {
   COMMON_TERMINAL_WIDTHS,
   TerminalPreferencesManager,
@@ -27,8 +28,9 @@ export class TerminalSettingsModal extends LitElement {
   connectedCallback() {
     super.connectedCallback();
 
-    // Load theme from TerminalPreferencesManager
+    // Load settings from TerminalPreferencesManager
     this.terminalTheme = this.preferencesManager.getTheme();
+    this.terminalFontFamily = this.preferencesManager.getFontFamily();
   }
 
   private preferencesManager = TerminalPreferencesManager.getInstance();
@@ -36,6 +38,7 @@ export class TerminalSettingsModal extends LitElement {
   @property({ type: Boolean }) visible = false;
   @property({ type: Number }) terminalMaxCols = 0;
   @property({ type: Number }) terminalFontSize = 14;
+  @property({ type: String }) terminalFontFamily = '';
 
   private _terminalTheme: TerminalThemeId = 'auto';
   @property({ type: String })
@@ -52,6 +55,7 @@ export class TerminalSettingsModal extends LitElement {
   @property({ type: Function }) onWidthSelect?: (width: number) => void;
   @property({ type: Function }) onFontSizeChange?: (size: number) => void;
   @property({ type: Function }) onThemeChange?: (theme: TerminalThemeId) => void;
+  @property({ type: Function }) onFontFamilyChange?: (fontFamily: string) => void;
   @property({ type: Function }) onClose?: () => void;
   @property({ type: Boolean }) isMobile = false;
 
@@ -93,6 +97,10 @@ export class TerminalSettingsModal extends LitElement {
 
   updated(changedProperties: Map<string | number | symbol, unknown>) {
     super.updated(changedProperties);
+
+    if (changedProperties.has('visible') && this.visible) {
+      this.terminalFontFamily = this.preferencesManager.getFontFamily();
+    }
 
     // Force update the theme select value when terminalTheme property changes OR when visible changes
     if (changedProperties.has('terminalTheme') || changedProperties.has('visible')) {
@@ -268,6 +276,25 @@ export class TerminalSettingsModal extends LitElement {
               </div>
             </div>
             
+            <!-- Font family setting -->
+            <div class="grid grid-cols-[120px_1fr] gap-4 items-center">
+              <label class="text-sm font-medium text-text-bright text-right">Font Family</label>
+              <input
+                type="text"
+                class="w-full bg-bg-secondary border border-border rounded-md px-4 py-3 text-sm font-mono text-text focus:border-primary focus:shadow-glow-sm"
+                .value=${this.terminalFontFamily || TERMINAL_FONT_FAMILY}
+                placeholder="e.g. SF Mono, Menlo, monospace"
+                @click=${(e: Event) => e.stopPropagation()}
+                @mousedown=${(e: Event) => e.stopPropagation()}
+                @change=${(e: Event) => {
+                  e.stopPropagation();
+                  const value = (e.target as HTMLInputElement).value;
+                  this.terminalFontFamily = value;
+                  this.onFontFamilyChange?.(value);
+                }}
+              />
+            </div>
+
             <!-- Theme setting -->
             <div class="grid grid-cols-[120px_1fr] gap-4 items-center">
               <label class="text-sm font-medium text-text-bright text-right">Theme</label>

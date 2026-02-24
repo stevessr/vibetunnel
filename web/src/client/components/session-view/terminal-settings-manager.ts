@@ -10,6 +10,7 @@
 import type { Session } from '../../../shared/types.js';
 import { clearCharacterWidthCache } from '../../utils/cursor-position.js';
 import { createLogger } from '../../utils/logger.js';
+import { TERMINAL_FONT_FAMILY } from '../../utils/terminal-constants.js';
 import {
   COMMON_TERMINAL_WIDTHS,
   TerminalPreferencesManager,
@@ -26,6 +27,7 @@ export interface TerminalSettingsCallbacks {
   setTerminalMaxCols: (cols: number) => void;
   setTerminalFontSize: (size: number) => void;
   setTerminalTheme: (theme: TerminalThemeId) => void;
+  setTerminalFontFamily: (fontFamily: string) => void;
   setShowWidthSelector: (show: boolean) => void;
   setCustomWidth: (width: string) => void;
   getTerminalLifecycleManager: () => {
@@ -43,6 +45,7 @@ export class TerminalSettingsManager {
   private terminalMaxCols = 0;
   private terminalFontSize = 14;
   private terminalTheme: TerminalThemeId = 'auto';
+  private terminalFontFamily = TERMINAL_FONT_FAMILY;
   private terminalFitHorizontally = false;
 
   constructor() {
@@ -58,6 +61,7 @@ export class TerminalSettingsManager {
       callbacks.setTerminalMaxCols(this.terminalMaxCols);
       callbacks.setTerminalFontSize(this.terminalFontSize);
       callbacks.setTerminalTheme(this.terminalTheme);
+      callbacks.setTerminalFontFamily(this.terminalFontFamily);
     }
   }
 
@@ -65,10 +69,12 @@ export class TerminalSettingsManager {
     this.terminalMaxCols = this.preferencesManager.getMaxCols();
     this.terminalFontSize = this.preferencesManager.getFontSize();
     this.terminalTheme = this.preferencesManager.getTheme();
+    this.terminalFontFamily = this.preferencesManager.getFontFamily();
     logger.debug('Loaded terminal preferences:', {
       maxCols: this.terminalMaxCols,
       fontSize: this.terminalFontSize,
       theme: this.terminalTheme,
+      fontFamily: this.terminalFontFamily,
     });
   }
 
@@ -83,6 +89,10 @@ export class TerminalSettingsManager {
 
   getTheme(): TerminalThemeId {
     return this.terminalTheme;
+  }
+
+  getFontFamily(): string {
+    return this.terminalFontFamily;
   }
 
   // Width management
@@ -209,6 +219,24 @@ export class TerminalSettingsManager {
     }
   }
 
+  handleFontFamilyChange(newFontFamily: string): void {
+    if (!this.callbacks) return;
+
+    const normalized = newFontFamily.trim() || TERMINAL_FONT_FAMILY;
+    this.terminalFontFamily = normalized;
+    this.preferencesManager.setFontFamily(normalized);
+    this.callbacks.setTerminalFontFamily(normalized);
+
+    const terminal = this.callbacks.getTerminalElement();
+    if (terminal) {
+      terminal.fontFamily = normalized;
+      terminal.requestUpdate();
+    }
+
+    // Font family changes affect char metrics used by IME positioning.
+    clearCharacterWidthCache();
+  }
+
   // Terminal fit toggle
   handleTerminalFitToggle(): void {
     if (!this.callbacks) return;
@@ -237,6 +265,10 @@ export class TerminalSettingsManager {
     return this.terminalTheme;
   }
 
+  getTerminalFontFamily(): string {
+    return this.terminalFontFamily;
+  }
+
   getTerminalFitHorizontally(): boolean {
     return this.terminalFitHorizontally;
   }
@@ -246,5 +278,6 @@ export class TerminalSettingsManager {
     terminal.maxCols = this.terminalMaxCols;
     terminal.fontSize = this.terminalFontSize;
     terminal.theme = this.terminalTheme;
+    terminal.fontFamily = this.terminalFontFamily;
   }
 }

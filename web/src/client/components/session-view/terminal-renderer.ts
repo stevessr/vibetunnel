@@ -30,6 +30,7 @@ export class TerminalRenderer extends LitElement {
   @property({ type: Number }) terminalFontSize = 14;
   @property({ type: Number }) terminalMaxCols = 0;
   @property({ type: String }) terminalTheme: TerminalThemeId = 'auto';
+  @property({ type: String }) terminalFontFamily = '';
   @property({ type: Boolean }) disableClick = false;
   @property({ type: Boolean }) hideScrollButton = false;
   @property({ type: Boolean }) isMobile = false;
@@ -56,6 +57,7 @@ export class TerminalRenderer extends LitElement {
         .fitHorizontally=${false}
         .maxCols=${this.terminalMaxCols}
         .theme=${this.terminalTheme}
+        .fontFamily=${this.terminalFontFamily}
         .initialCols=${this.session.initialCols || 0}
         .initialRows=${this.session.initialRows || 0}
         .disableClick=${this.disableClick}

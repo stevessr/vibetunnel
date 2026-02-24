@@ -37,6 +37,8 @@ export interface OverlaysCallbacks {
   onWidthSelect: (width: number) => void;
   onFontSizeChange: (size: number) => void;
   onThemeChange: (theme: TerminalThemeId) => void;
+  onFontFamilyChange: (fontFamily: string) => void;
+  getTerminalFontFamily: () => string;
   onCloseWidthSelector: () => void;
 
   // Keyboard button
@@ -161,11 +163,13 @@ export class OverlaysContainer extends LitElement {
         .terminalMaxCols=${this.uiState.terminalMaxCols}
         .terminalFontSize=${this.uiState.terminalFontSize}
         .terminalTheme=${this.uiState.terminalTheme}
+        .terminalFontFamily=${this.callbacks.getTerminalFontFamily()}
         .customWidth=${this.uiState.customWidth}
         .isMobile=${this.uiState.isMobile}
         .onWidthSelect=${this.callbacks.onWidthSelect}
         .onFontSizeChange=${this.callbacks.onFontSizeChange}
         .onThemeChange=${this.callbacks.onThemeChange}
+        .onFontFamilyChange=${this.callbacks.onFontFamilyChange}
         .onClose=${this.callbacks.onCloseWidthSelector}
       ></terminal-settings-modal>
       

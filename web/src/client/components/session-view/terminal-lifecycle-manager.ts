@@ -41,6 +41,7 @@ export class TerminalLifecycleManager {
   private terminalMaxCols = 0;
   private terminalTheme: TerminalThemeId = 'auto';
   private resizeTimeout: number | null = null;
+  private streamConnectTimeout: number | null = null;
   private lastResizeWidth = 0;
   private lastResizeHeight = 0;
   private stableCols = 0;
@@ -180,7 +181,9 @@ export class TerminalLifecycleManager {
 
     // Connect to stream directly without artificial delays
     // Use setTimeout to ensure we're still connected after all synchronous updates
-    setTimeout(() => {
+    this.streamConnectTimeout = window.setTimeout(() => {
+      this.streamConnectTimeout = null;
+
       if (this.connected && this.connectionManager) {
         logger.debug('Connecting to stream for terminal', {
           terminalElement: !!this.terminal,
@@ -378,6 +381,11 @@ export class TerminalLifecycleManager {
     if (this.resizeTimeout) {
       clearTimeout(this.resizeTimeout);
       this.resizeTimeout = null;
+    }
+
+    if (this.streamConnectTimeout !== null) {
+      clearTimeout(this.streamConnectTimeout);
+      this.streamConnectTimeout = null;
     }
   }
 }

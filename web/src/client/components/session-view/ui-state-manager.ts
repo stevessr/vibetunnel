@@ -48,6 +48,7 @@ export interface UIState {
   terminalMaxCols: number;
   terminalFontSize: number;
   terminalTheme: TerminalThemeId;
+  terminalFontFamily: string;
 
   // View mode
   viewMode: 'terminal' | 'worktree';
@@ -101,6 +102,7 @@ export class UIStateManager {
     terminalMaxCols: 0,
     terminalFontSize: 14,
     terminalTheme: 'auto',
+    terminalFontFamily: '',
 
     // View mode
     viewMode: 'terminal',
@@ -258,6 +260,11 @@ export class UIStateManager {
 
   setTerminalTheme(theme: TerminalThemeId): void {
     this.state.terminalTheme = theme;
+    this.callbacks?.requestUpdate();
+  }
+
+  setTerminalFontFamily(fontFamily: string): void {
+    this.state.terminalFontFamily = fontFamily;
     this.callbacks?.requestUpdate();
   }
 

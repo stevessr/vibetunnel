@@ -5,6 +5,7 @@
 
 import { createLogger } from './logger.js';
 import { detectMobile } from './mobile-utils.js';
+import { TERMINAL_FONT_FAMILY } from './terminal-constants.js';
 import type { TerminalThemeId } from './terminal-themes.js';
 
 const logger = createLogger('terminal-preferences');
@@ -14,6 +15,7 @@ export interface TerminalPreferences {
   fontSize: number;
   fitHorizontally: boolean;
   theme: TerminalThemeId;
+  fontFamily: string;
 }
 
 // Common terminal widths
@@ -31,6 +33,7 @@ const DEFAULT_PREFERENCES: TerminalPreferences = {
   fontSize: detectMobile() ? 12 : 14, // 12px on mobile, 14px on desktop
   fitHorizontally: false,
   theme: 'dracula',
+  fontFamily: TERMINAL_FONT_FAMILY,
 };
 
 const STORAGE_KEY_TERMINAL_PREFS = 'vibetunnel_terminal_preferences';
@@ -111,6 +114,16 @@ export class TerminalPreferencesManager {
   setTheme(theme: TerminalThemeId) {
     logger.debug('Setting terminal theme:', theme);
     this.preferences.theme = theme;
+    this.savePreferences();
+  }
+
+  getFontFamily(): string {
+    return this.preferences.fontFamily || TERMINAL_FONT_FAMILY;
+  }
+
+  setFontFamily(fontFamily: string): void {
+    const trimmed = fontFamily.trim();
+    this.preferences.fontFamily = trimmed.length > 0 ? trimmed : TERMINAL_FONT_FAMILY;
     this.savePreferences();
   }
 

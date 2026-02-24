@@ -47,6 +47,7 @@ export class Terminal extends LitElement {
   @property({ type: Number }) fontSize = 14;
   @property({ type: Boolean }) fitHorizontally = false;
   @property({ type: Number }) maxCols = 0; // 0 = unlimited
+  @property({ type: String }) fontFamily = TERMINAL_FONT_FAMILY;
   @property({ type: String }) theme: TerminalThemeId = 'auto';
   @property({ type: Boolean }) disableClick = false;
   @property({ type: Boolean }) hideScrollButton = false;
@@ -81,6 +82,7 @@ export class Terminal extends LitElement {
   connectedCallback() {
     const prefs = TerminalPreferencesManager.getInstance();
     this.theme = prefs.getTheme();
+    this.fontFamily = prefs.getFontFamily();
     super.connectedCallback();
 
     this.originalFontSize = this.fontSize;
@@ -126,6 +128,11 @@ export class Terminal extends LitElement {
       if (!this.fitHorizontally) this.originalFontSize = this.fontSize;
       this.applyFontSize();
       this.requestResize('font-size-change');
+    }
+
+    if (changed.has('fontFamily')) {
+      this.applyFontFamily();
+      this.requestResize('font-family-change');
     }
 
     if (changed.has('fitHorizontally')) {
@@ -294,6 +301,12 @@ export class Terminal extends LitElement {
     this.terminal.options.fontSize = this.fontSize;
   }
 
+  private applyFontFamily() {
+    if (!this.terminal) return;
+    const trimmed = this.fontFamily.trim();
+    this.terminal.options.fontFamily = trimmed.length > 0 ? trimmed : TERMINAL_FONT_FAMILY;
+  }
+
   private getResolvedTheme() {
     const effectiveTheme = this.theme === 'auto' ? getCurrentTheme() : this.theme;
     const themeId: TerminalThemeId = effectiveTheme === 'dark' ? 'dark' : 'light';
@@ -415,7 +428,7 @@ export class Terminal extends LitElement {
         cols: this.cols,
         rows: this.rows,
         fontSize: this.fontSize,
-        fontFamily: TERMINAL_FONT_FAMILY,
+        fontFamily: this.fontFamily,
         theme: this.getResolvedTheme(),
         cursorBlink: true,
         smoothScrollDuration: 120,
