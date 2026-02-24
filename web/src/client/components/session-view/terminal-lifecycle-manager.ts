@@ -19,6 +19,7 @@ const logger = createLogger('terminal-lifecycle-manager');
 const MIN_SAFE_COLS = 20;
 const MIN_SAFE_ROWS = 6;
 const TUIS_RECOMMENDED_ROWS = 10;
+const TUIS_RECOMMENDED_COLS = 80;
 
 export interface TerminalEventHandlers {
   handleSessionExit: (e: Event) => void;
@@ -44,6 +45,7 @@ export class TerminalLifecycleManager {
   private lastResizeHeight = 0;
   private stableCols = 0;
   private stableRows = 0;
+  private hasConfirmedServerResize = false;
   private domElement: Element | null = null;
   private eventHandlers: TerminalEventHandlers | null = null;
   private stateCallbacks: TerminalStateCallbacks | null = null;
@@ -54,8 +56,11 @@ export class TerminalLifecycleManager {
     if (!session) {
       this.stableCols = 0;
       this.stableRows = 0;
+      this.hasConfirmedServerResize = false;
       return;
     }
+
+    this.hasConfirmedServerResize = false;
 
     if (session.initialCols && session.initialCols >= MIN_SAFE_COLS) {
       this.stableCols = session.initialCols;
@@ -187,6 +192,46 @@ export class TerminalLifecycleManager {
         logger.warn(`Component disconnected before stream connection`);
       }
     }, 0);
+
+    // Ensure PTY starts with a usable size for TUI apps before first manual resize settles.
+    // btop/btm can fail if initial size is too small/invalid when they start.
+    const bootstrapCols = Math.max(
+      TUIS_RECOMMENDED_COLS,
+      this.session.initialCols ?? 0,
+      this.stableCols,
+      this.terminal.cols || 0
+    );
+    const bootstrapRows = Math.max(
+      TUIS_RECOMMENDED_ROWS,
+      this.session.initialRows ?? 0,
+      this.stableRows,
+      this.terminal.rows || 0
+    );
+
+    this.stateCallbacks?.updateTerminalDimensions(bootstrapCols, bootstrapRows);
+
+    this.lastResizeWidth = bootstrapCols;
+    this.lastResizeHeight = bootstrapRows;
+    this.stableCols = bootstrapCols;
+    this.stableRows = bootstrapRows;
+
+    if (!this.hasConfirmedServerResize) {
+      this.hasConfirmedServerResize = true;
+      try {
+        const sent = terminalSocketClient.resize(this.session.id, bootstrapCols, bootstrapRows);
+        if (!sent) {
+          fetch(`/api/sessions/${this.session.id}/resize`, {
+            method: HttpMethod.POST,
+            headers: { 'Content-Type': 'application/json', ...authClient.getAuthHeader() },
+            body: JSON.stringify({ cols: bootstrapCols, rows: bootstrapRows }),
+          }).catch((error) => {
+            logger.warn('failed to bootstrap terminal size via HTTP', error);
+          });
+        }
+      } catch (error) {
+        logger.warn('failed to bootstrap terminal size', error);
+      }
+    }
   }
 
   async handleTerminalResize(event: Event) {
@@ -216,9 +261,9 @@ export class TerminalLifecycleManager {
     const fallbackCols =
       this.stableCols >= MIN_SAFE_COLS
         ? this.stableCols
-        : this.session?.initialCols && this.session.initialCols >= MIN_SAFE_COLS
+        : this.session?.initialCols && this.session.initialCols >= TUIS_RECOMMENDED_COLS
           ? this.session.initialCols
-          : MIN_SAFE_COLS;
+          : TUIS_RECOMMENDED_COLS;
     const fallbackRows =
       this.stableRows >= MIN_SAFE_ROWS
         ? this.stableRows

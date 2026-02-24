@@ -85,7 +85,7 @@ export class MultiplexerModal extends LitElement {
       // Get status of all multiplexers
       const statusResponse = await withTimeout(
         apiClient.get<MultiplexerStatus>('/multiplexer/status'),
-        5000,
+        8000,
         'Loading multiplexer status'
       );
       this.multiplexerStatus = statusResponse;
@@ -447,29 +447,29 @@ export class MultiplexerModal extends LitElement {
             ${
               this.loading
                 ? html`<div class="mb-4 p-3 bg-bg-tertiary rounded-lg text-text-muted text-center">Loading terminal sessions...</div>`
-                : !status
-                  ? html`<div class="mb-4 p-3 bg-bg-tertiary rounded-lg text-text-muted text-center">No multiplexer status available</div>`
-                  : !status.tmux.available &&
-                      !status.zellij.available &&
-                      !status.screen.available &&
-                      !status.kitty.available
-                    ? html`
+                : this.error
+                  ? html`<div class="mb-4 p-3 bg-bg-tertiary rounded-lg text-text-muted text-center">${this.error}</div>`
+                  : !status
+                    ? html`<div class="mb-4 p-3 bg-bg-tertiary rounded-lg text-text-muted text-center">No multiplexer status available</div>`
+                    : !status.tmux.available &&
+                        !status.zellij.available &&
+                        !status.screen.available &&
+                        !status.kitty.available
+                      ? html`
                       <div class="text-center py-12 text-text-muted">
                         <h3 class="m-0 mb-2 text-text">No Terminal Multiplexer Available</h3>
                         <p>No terminal multiplexer (tmux, Zellij, or Screen) is installed on this system.</p>
                         <p>Install tmux, Zellij, or GNU Screen to use this feature.</p>
                       </div>
                     `
-                    : !activeMultiplexer?.available
-                      ? html`
+                      : !activeMultiplexer?.available
+                        ? html`
                         <div class="text-center py-12 text-text-muted">
                           <h3 class="m-0 mb-2 text-text">${this.activeTab} Not Available</h3>
                           <p>${this.activeTab} is not installed or not available on this system.</p>
                           <p>Install ${this.activeTab} to use this feature.</p>
                         </div>
                       `
-                      : this.error
-                        ? html`<div class="mb-4 p-3 bg-bg-tertiary rounded-lg text-text-muted text-center">${this.error}</div>`
                         : activeMultiplexer.sessions.length === 0
                           ? html`
                             <div class="text-center py-12 text-text-muted">
