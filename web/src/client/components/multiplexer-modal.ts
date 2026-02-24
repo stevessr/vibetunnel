@@ -10,7 +10,46 @@ import type {
   TmuxWindow,
 } from '../../shared/multiplexer-types.js';
 import { apiClient } from '../services/api-client.js';
+import { detectMobile as detectMobileByUA } from '../utils/mobile-utils.js';
 import './modal-wrapper.js';
+
+const MIN_COLS = 20;
+const MIN_ROWS = 10;
+const MAX_COLS = 1000;
+const MAX_ROWS = 1000;
+const MOBILE_BASE_COLS = 80;
+const MOBILE_BASE_ROWS = 24;
+const DESKTOP_BASE_COLS = 120;
+const DESKTOP_BASE_ROWS = 30;
+const MOBILE_WIDTH_GUARD_PX = 24;
+const MOBILE_HEIGHT_GUARD_PX = 72;
+const DESKTOP_WIDTH_GUARD_PX = 48;
+const DESKTOP_HEIGHT_GUARD_PX = 96;
+const FALLBACK_CHAR_WIDTH_PX = 9;
+const FALLBACK_LINE_HEIGHT_PX = 18;
+
+function computeAdaptiveInitialTerminalSize(): { cols: number; rows: number } {
+  const isMobile = detectMobileByUA();
+  const viewportWidth = Math.max(0, window.innerWidth || 0);
+  const viewportHeight = Math.max(0, window.innerHeight || 0);
+
+  const widthGuard = isMobile ? MOBILE_WIDTH_GUARD_PX : DESKTOP_WIDTH_GUARD_PX;
+  const heightGuard = isMobile ? MOBILE_HEIGHT_GUARD_PX : DESKTOP_HEIGHT_GUARD_PX;
+
+  const usableWidth = Math.max(0, viewportWidth - widthGuard);
+  const usableHeight = Math.max(0, viewportHeight - heightGuard);
+
+  const fitCols = Math.floor(usableWidth / FALLBACK_CHAR_WIDTH_PX);
+  const fitRows = Math.floor(usableHeight / FALLBACK_LINE_HEIGHT_PX);
+
+  const baseCols = isMobile ? MOBILE_BASE_COLS : DESKTOP_BASE_COLS;
+  const baseRows = isMobile ? MOBILE_BASE_ROWS : DESKTOP_BASE_ROWS;
+
+  const cols = Math.max(MIN_COLS, Math.min(MAX_COLS, fitCols > 0 ? fitCols : baseCols));
+  const rows = Math.max(MIN_ROWS, Math.min(MAX_ROWS, fitRows > 0 ? fitRows : baseRows));
+
+  return { cols, rows };
+}
 
 @customElement('multiplexer-modal')
 export class MultiplexerModal extends LitElement {
@@ -197,6 +236,7 @@ export class MultiplexerModal extends LitElement {
 
   private async attachToSession(target: MultiplexerTarget) {
     try {
+      const adaptive = computeAdaptiveInitialTerminalSize();
       const response = await apiClient.post<{
         success: boolean;
         sessionId?: string;
@@ -206,8 +246,8 @@ export class MultiplexerModal extends LitElement {
         sessionName: target.session,
         windowIndex: target.window,
         paneIndex: target.pane,
-        cols: window.innerWidth > 768 ? 120 : 80,
-        rows: window.innerHeight > 600 ? 30 : 24,
+        cols: adaptive.cols,
+        rows: adaptive.rows,
         titleMode: 'static',
         metadata: {
           source: 'multiplexer-modal',
@@ -252,6 +292,7 @@ export class MultiplexerModal extends LitElement {
 
       // For all multiplexers, attach to the session
       // Zellij will create the session automatically with the -c flag
+      const adaptive = computeAdaptiveInitialTerminalSize();
       const attachResponse = await apiClient.post<{
         success: boolean;
         sessionId?: string;
@@ -259,8 +300,8 @@ export class MultiplexerModal extends LitElement {
       }>('/multiplexer/attach', {
         type: this.activeTab,
         sessionName: sessionName,
-        cols: window.innerWidth > 768 ? 120 : 80,
-        rows: window.innerHeight > 600 ? 30 : 24,
+        cols: adaptive.cols,
+        rows: adaptive.rows,
         titleMode: 'static',
         metadata: {
           source: 'multiplexer-modal-new',

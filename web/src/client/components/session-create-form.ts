@@ -30,6 +30,7 @@ import { ServerConfigService } from '../services/server-config-service.js';
 import { type SessionCreateData, SessionService } from '../services/session-service.js';
 import { parseCommand } from '../utils/command-utils.js';
 import { createLogger } from '../utils/logger.js';
+import { detectMobile as detectMobileByUA } from '../utils/mobile-utils.js';
 import { formatPathForDisplay } from '../utils/path-utils.js';
 import {
   getSessionFormValue,
@@ -53,6 +54,47 @@ import {
 import type { QuickStartItem } from './session-create-form/quick-start-section.js';
 
 const logger = createLogger('session-create-form');
+
+const MIN_COLS = 20;
+const MIN_ROWS = 10;
+const MAX_COLS = 1000;
+const MAX_ROWS = 1000;
+const MOBILE_BASE_COLS = 80;
+const MOBILE_BASE_ROWS = 24;
+const DESKTOP_BASE_COLS = 120;
+const DESKTOP_BASE_ROWS = 30;
+const MOBILE_WIDTH_GUARD_PX = 24;
+const MOBILE_HEIGHT_GUARD_PX = 72;
+const DESKTOP_WIDTH_GUARD_PX = 48;
+const DESKTOP_HEIGHT_GUARD_PX = 96;
+const FALLBACK_CHAR_WIDTH_PX = 9;
+const FALLBACK_LINE_HEIGHT_PX = 18;
+
+function computeAdaptiveInitialTerminalSize(): { cols: number; rows: number } {
+  const isMobile = detectMobileByUA();
+  const viewportWidth = Math.max(0, window.innerWidth || 0);
+  const viewportHeight = Math.max(0, window.innerHeight || 0);
+
+  const widthGuard = isMobile ? MOBILE_WIDTH_GUARD_PX : DESKTOP_WIDTH_GUARD_PX;
+  const heightGuard = isMobile ? MOBILE_HEIGHT_GUARD_PX : DESKTOP_HEIGHT_GUARD_PX;
+
+  const usableWidth = Math.max(0, viewportWidth - widthGuard);
+  const usableHeight = Math.max(0, viewportHeight - heightGuard);
+
+  const measuredCharWidth = Math.max(1, FALLBACK_CHAR_WIDTH_PX);
+  const measuredLineHeight = Math.max(1, FALLBACK_LINE_HEIGHT_PX);
+
+  const fitCols = Math.floor(usableWidth / measuredCharWidth);
+  const fitRows = Math.floor(usableHeight / measuredLineHeight);
+
+  const baseCols = isMobile ? MOBILE_BASE_COLS : DESKTOP_BASE_COLS;
+  const baseRows = isMobile ? MOBILE_BASE_ROWS : DESKTOP_BASE_ROWS;
+
+  const cols = Math.max(MIN_COLS, Math.min(MAX_COLS, fitCols > 0 ? fitCols : baseCols));
+  const rows = Math.max(MIN_ROWS, Math.min(MAX_ROWS, fitRows > 0 ? fitRows : baseRows));
+
+  return { cols, rows };
+}
 
 @customElement('session-create-form')
 export class SessionCreateForm extends LitElement {
@@ -509,10 +551,11 @@ export class SessionCreateForm extends LitElement {
 
     // Only add dimensions for web sessions (not external terminal spawns)
     if (!effectiveSpawnTerminal) {
-      // Use conservative defaults that work well across devices
-      // The terminal will auto-resize to fit the actual container after creation
-      sessionData.cols = 120;
-      sessionData.rows = 30;
+      // Seed server-side PTY with viewport-adaptive dimensions.
+      // Runtime resize events will still fine-tune after mount.
+      const adaptive = computeAdaptiveInitialTerminalSize();
+      sessionData.cols = adaptive.cols;
+      sessionData.rows = adaptive.rows;
     }
 
     // Add session name if provided
