@@ -408,6 +408,41 @@ export class TerminalChatView extends LitElement {
     .option-text {
       line-height: 1.3;
     }
+
+    .tab-completion-panel {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+      padding: 0.5rem 0.875rem;
+      background-color: rgb(35 40 45);
+      border-top: 1px solid rgb(50 55 60);
+    }
+
+    .tab-completion-button {
+      padding: 0.375rem 0.625rem;
+      border: 1px solid rgb(70 80 90);
+      border-radius: 0.625rem;
+      background-color: rgb(45 52 58);
+      color: rgb(210 216 222);
+      font-family: inherit;
+      font-size: 0.8rem;
+      line-height: 1.3;
+      cursor: pointer;
+      transition: all 0.15s ease;
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    .tab-completion-button:hover {
+      border-color: rgb(0 168 132 / 0.8);
+      background-color: rgb(52 60 66);
+      color: #ffffff;
+    }
+
+    .tab-completion-button.active {
+      border-color: rgb(0 168 132);
+      background-color: rgb(0 168 132 / 0.18);
+      color: #ffffff;
+    }
   `;
 
   @property() onSend?: (data: string) => void;
@@ -422,7 +457,10 @@ export class TerminalChatView extends LitElement {
   @state() private messages: ChatMessage[] = [];
   @state() private chatInputValue = '';
   @state() private inputSuggestion = '';
+  @state() private inputSuggestionSource: 'fish' | 'tab' | null = null;
   @state() private suppressEchoUntilInputChange = false;
+  @state() private tabCompletions: string[] = [];
+  @state() private tabCompletionIndex = -1;
 
   @query('#chat-input-field')
   private inputElement!: HTMLInputElement;
@@ -509,6 +547,9 @@ export class TerminalChatView extends LitElement {
         this.outputLineBuffer = '';
         this.carriageReturnPending = false;
         this.inputSuggestion = '';
+        this.inputSuggestionSource = null;
+        this.tabCompletions = [];
+        this.tabCompletionIndex = -1;
         this.suppressEchoUntilInputChange = false;
 
         // Priority: pendingInput only
@@ -542,6 +583,9 @@ export class TerminalChatView extends LitElement {
         this.carriageReturnPending = false;
         this.chatInputValue = '';
         this.inputSuggestion = '';
+        this.inputSuggestionSource = null;
+        this.tabCompletions = [];
+        this.tabCompletionIndex = -1;
         this.suppressEchoUntilInputChange = false;
         if (this.inputElement) {
           this.inputElement.value = '';
@@ -905,6 +949,9 @@ export class TerminalChatView extends LitElement {
     const baseInput = this.chatInputValue;
     if (!baseInput) {
       this.inputSuggestion = '';
+      this.inputSuggestionSource = null;
+      this.tabCompletions = [];
+      this.tabCompletionIndex = -1;
       return;
     }
 
@@ -912,33 +959,103 @@ export class TerminalChatView extends LitElement {
     if (!cleanChunk) return;
 
     const normalizedChunk = this.applyBackspaces(cleanChunk);
-    const segments = normalizedChunk
+
+    // Fish autosuggestion usually appears on the current redraw line (carriage-return redraw)
+    // or a single live line.
+    // Avoid scanning all output lines, which can produce false positives from command output.
+    let liveLine = '';
+    const lastCr = normalizedChunk.lastIndexOf('\r');
+    if (lastCr !== -1) {
+      liveLine = normalizedChunk.slice(lastCr + 1);
+    } else if (!normalizedChunk.includes('\n')) {
+      liveLine = normalizedChunk;
+    }
+
+    const trimmedLiveLine = liveLine.trimEnd();
+    if (!trimmedLiveLine) {
+      if (this.inputSuggestion && !this.inputSuggestion.startsWith(baseInput)) {
+        this.inputSuggestion = '';
+        this.inputSuggestionSource = null;
+      }
+      this.tabCompletions = [];
+      this.tabCompletionIndex = -1;
+      return;
+    }
+
+    const promptStripped = trimmedLiveLine.replace(/^[\s]*[❯➜$#%>]+\s*/, '');
+
+    for (const candidateLine of [promptStripped, trimmedLiveLine]) {
+      const index = candidateLine.lastIndexOf(baseInput);
+      if (index === -1) continue;
+
+      const prevChar = index > 0 ? candidateLine[index - 1] : '';
+      if (prevChar && /[a-zA-Z0-9_]/.test(prevChar)) continue;
+
+      const candidate = candidateLine.slice(index).trimEnd();
+      if (!candidate.startsWith(baseInput)) continue;
+      if (candidate === baseInput) continue;
+      if (candidate.length > baseInput.length + 160) continue;
+
+      this.inputSuggestion = candidate;
+      this.inputSuggestionSource = 'fish';
+      this.tabCompletions = [];
+      this.tabCompletionIndex = -1;
+      return;
+    }
+
+    // Tab multi-completion list extraction from chunk lines.
+    const lines = normalizedChunk
       .split(/[\r\n]+/)
-      .map((segment) => segment.trimEnd())
-      .filter((segment) => segment.length > 0);
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0);
 
-    // Find the most plausible fish autosuggestion line containing current input.
-    for (let i = segments.length - 1; i >= 0; i--) {
-      const segment = segments[i];
-      const withoutPrompt = segment.replace(/^[\s]*[❯➜$#%>]+\s*/, '');
+    const itemSet = new Set<string>();
+    for (const line of lines) {
+      const tokens = line
+        .split(/\s+/)
+        .map((token) => token.trim())
+        .filter((token) => token.length > 0);
 
-      for (const candidateLine of [withoutPrompt, segment]) {
-        const index = candidateLine.lastIndexOf(baseInput);
-        if (index === -1) continue;
-
-        const candidate = candidateLine.slice(index).trimEnd();
-        if (!candidate.startsWith(baseInput)) continue;
-        if (candidate === baseInput) continue;
-        if (candidate.length > baseInput.length + 256) continue;
-
-        this.inputSuggestion = candidate;
-        return;
+      for (const token of tokens) {
+        if (!token.startsWith(baseInput)) continue;
+        if (token === baseInput) continue;
+        if (token.length > baseInput.length + 160) continue;
+        const hasDisallowedSymbol = [...token].some((char) => '`\'"|<>[](){}'.includes(char));
+        if (hasDisallowedSymbol) continue;
+        itemSet.add(token);
       }
     }
+
+    const candidates = [...itemSet].sort((a, b) => a.localeCompare(b)).slice(0, 20);
+
+    if (candidates.length >= 2) {
+      const previousActive =
+        this.tabCompletionIndex >= 0 && this.tabCompletionIndex < this.tabCompletions.length
+          ? this.tabCompletions[this.tabCompletionIndex]
+          : null;
+
+      this.tabCompletions = candidates;
+      this.inputSuggestionSource = null;
+
+      if (previousActive) {
+        const nextIndex = candidates.indexOf(previousActive);
+        this.tabCompletionIndex = nextIndex >= 0 ? nextIndex : 0;
+      } else {
+        this.tabCompletionIndex = 0;
+      }
+
+      this.inputSuggestion = this.tabCompletions[this.tabCompletionIndex] ?? '';
+      this.inputSuggestionSource = this.inputSuggestion ? 'tab' : null;
+      return;
+    }
+
+    this.tabCompletions = [];
+    this.tabCompletionIndex = -1;
 
     // Keep previous suggestion unless a hard mismatch is detected.
     if (this.inputSuggestion && !this.inputSuggestion.startsWith(baseInput)) {
       this.inputSuggestion = '';
+      this.inputSuggestionSource = null;
     }
   }
 
@@ -962,9 +1079,57 @@ export class TerminalChatView extends LitElement {
     this.lastSentValue = accepted;
     this.onPendingInputChange?.(accepted);
     this.inputSuggestion = '';
+    this.inputSuggestionSource = null;
+    this.tabCompletions = [];
+    this.tabCompletionIndex = -1;
 
     // fish usually echoes the accepted command line once; keep that out of chat messages.
     this.suppressEchoUntilInputChange = true;
+  }
+
+  private applyTabCompletion(candidate: string): void {
+    if (!candidate) return;
+    if (!this.chatInputValue) return;
+    if (!candidate.startsWith(this.chatInputValue)) return;
+
+    this.chatInputValue = candidate;
+    if (this.inputElement) {
+      this.inputElement.value = candidate;
+      this.inputElement.setSelectionRange(candidate.length, candidate.length);
+      this.inputElement.focus();
+    }
+
+    this.onSend?.('\t');
+
+    this.lastSentValue = candidate;
+    this.onPendingInputChange?.(candidate);
+    this.inputSuggestion = '';
+    this.inputSuggestionSource = null;
+    this.tabCompletions = [];
+    this.tabCompletionIndex = -1;
+    this.suppressEchoUntilInputChange = true;
+  }
+
+  private cycleTabCompletion(direction: 1 | -1): void {
+    if (!this.tabCompletions.length) return;
+
+    const total = this.tabCompletions.length;
+    const current = this.tabCompletionIndex >= 0 ? this.tabCompletionIndex : 0;
+    const next = (current + direction + total) % total;
+
+    this.tabCompletionIndex = next;
+    const candidate = this.tabCompletions[next];
+    this.inputSuggestion = candidate;
+    this.inputSuggestionSource = candidate ? 'tab' : null;
+
+    this.chatInputValue = candidate;
+    if (this.inputElement) {
+      this.inputElement.value = candidate;
+      this.inputElement.setSelectionRange(candidate.length, candidate.length);
+    }
+
+    this.onPendingInputChange?.(candidate);
+    this.sendDeltaToTerminal(candidate);
   }
 
   private addMessage(type: ChatMessage['type'], content: string) {
@@ -1295,7 +1460,9 @@ export class TerminalChatView extends LitElement {
               : this.messages.map((msg) => this.renderMessage(msg))
           }
         </div>
-        
+
+        ${this.renderTabCompletions()}
+
         <!-- Chat input area (WhatsApp style) -->
         <div
           class="chat-input-container"
@@ -1351,6 +1518,14 @@ export class TerminalChatView extends LitElement {
   }
 
   private handleInputKeydown(e: KeyboardEvent) {
+    if (e.key === 'Tab' && !e.ctrlKey && !e.altKey && !e.metaKey) {
+      if (this.tabCompletions.length >= 2) {
+        e.preventDefault();
+        this.cycleTabCompletion(e.shiftKey ? -1 : 1);
+        return;
+      }
+    }
+
     if (e.key === 'ArrowRight' && !e.shiftKey && !e.altKey && !e.ctrlKey && !e.metaKey) {
       if (this.inputSuggestion?.startsWith(this.chatInputValue)) {
         e.preventDefault();
@@ -1385,6 +1560,23 @@ export class TerminalChatView extends LitElement {
 
     if (this.inputSuggestion && !this.inputSuggestion.startsWith(newValue)) {
       this.inputSuggestion = '';
+      this.inputSuggestionSource = null;
+    }
+
+    if (this.tabCompletions.length > 0) {
+      this.tabCompletions = this.tabCompletions.filter(
+        (candidate) => candidate.startsWith(newValue) && candidate !== newValue
+      );
+
+      if (!this.tabCompletions.length) {
+        this.tabCompletionIndex = -1;
+      } else if (this.tabCompletionIndex >= this.tabCompletions.length) {
+        this.tabCompletionIndex = 0;
+      }
+
+      if (this.inputSuggestionSource === 'tab' && this.tabCompletionIndex >= 0) {
+        this.inputSuggestion = this.tabCompletions[this.tabCompletionIndex] ?? '';
+      }
     }
 
     // Update pending input for InputManager (for display sync)
@@ -1455,12 +1647,40 @@ export class TerminalChatView extends LitElement {
     input.value = '';
     this.chatInputValue = '';
     this.inputSuggestion = '';
+    this.inputSuggestionSource = null;
     this.lastSentValue = '';
 
     // Clear pending input in InputManager
     this.onPendingInputChange?.('');
 
+    this.tabCompletions = [];
+    this.tabCompletionIndex = -1;
+
     // Scroll to show the sent message
     this.scrollToBottom();
+  }
+
+  private renderTabCompletions() {
+    if (!this.tabCompletions.length || !this.chatInputValue) return null;
+
+    return html`
+      <div class="tab-completion-panel">
+        ${this.tabCompletions.map((candidate, index) => {
+          const isActive = index === this.tabCompletionIndex;
+          return html`
+            <button
+              class="tab-completion-button ${isActive ? 'active' : ''}"
+              @click=${() => this.applyTabCompletion(candidate)}
+              @touchend=${(e: TouchEvent) => {
+                e.preventDefault();
+                this.applyTabCompletion(candidate);
+              }}
+            >
+              ${candidate}
+            </button>
+          `;
+        })}
+      </div>
+    `;
   }
 }
