@@ -352,8 +352,12 @@ export class InputManager {
       return;
     }
 
-    // Allow standard browser copy/paste shortcuts
-    if (isCopyPasteShortcut(e)) {
+    // Allow standard browser copy/paste shortcuts, but keep Ctrl/Cmd+C as SIGINT when capture is active
+    const captureActive = this.callbacks?.getKeyboardCaptureActive?.() ?? true;
+    const normalizedKey = key.toLowerCase();
+    const isSigintShortcut =
+      e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey && normalizedKey === 'c';
+    if (isCopyPasteShortcut(e) && !(captureActive && isSigintShortcut)) {
       // Allow standard browser copy/paste to work
       return;
     }
@@ -593,6 +597,16 @@ export class InputManager {
   }
 
   isKeyboardShortcut(e: KeyboardEvent): boolean {
+    const key = e.key.toLowerCase();
+    const captureActive = this.callbacks?.getKeyboardCaptureActive?.() ?? true;
+
+    // Keep Ctrl/Cmd+C as terminal SIGINT when keyboard capture is active.
+    // This must run before browser-shortcut checks.
+    const isSigintShortcut = e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey && key === 'c';
+    if (captureActive && isSigintShortcut) {
+      return false;
+    }
+
     // Check if we're typing in an input field or editor
     const target = e.target as HTMLElement;
     if (
@@ -639,13 +653,9 @@ export class InputManager {
     const isMacOS =
       /Mac|iPhone|iPod|iPad/i.test(navigator.userAgent) ||
       (navigator.platform && navigator.platform.indexOf('Mac') >= 0);
-    const key = e.key.toLowerCase();
     if (isMacOS && e.metaKey && e.altKey && ['arrowleft', 'arrowright'].includes(key)) {
       return true;
     }
-
-    // Get keyboard capture state
-    const captureActive = this.callbacks?.getKeyboardCaptureActive?.() ?? true;
 
     // If capture is disabled, allow common browser shortcuts
     if (!captureActive) {

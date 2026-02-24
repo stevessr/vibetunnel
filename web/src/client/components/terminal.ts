@@ -12,6 +12,7 @@ import { FitAddon, Ghostty, Terminal as GhosttyTerminal } from 'ghostty-web';
 import { html, LitElement, type PropertyValues } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
 import { createLogger } from '../utils/logger.js';
+import { detectMobile as detectMobileByUA } from '../utils/mobile-utils.js';
 import { TERMINAL_FONT_FAMILY, TERMINAL_IDS } from '../utils/terminal-constants.js';
 import { TerminalPreferencesManager } from '../utils/terminal-preferences.js';
 import { TERMINAL_THEMES, type TerminalThemeId } from '../utils/terminal-themes.js';
@@ -306,8 +307,7 @@ export class Terminal extends LitElement {
   }
 
   private detectMobile() {
-    const MOBILE_BREAKPOINT = 768;
-    this.isMobile = window.innerWidth < MOBILE_BREAKPOINT;
+    this.isMobile = detectMobileByUA();
   }
 
   private applyHorizontalFit() {
@@ -561,8 +561,8 @@ export class Terminal extends LitElement {
   }
 
   private sanitizeTerminalOutput(input: string): string {
-    // ghostty-web currently warns on OSC 4 palette updates from some shells/themes.
-    // Drop only OSC 4 sequences while preserving all other terminal output.
+    // ghostty-web currently warns on OSC color palette/dynamic color updates from some shells/themes.
+    // Drop only known-problematic OSC color-setting commands while preserving all other output.
     const source = `${this.oscCarry}${input}`;
     this.oscCarry = '';
 
@@ -599,7 +599,12 @@ export class Terminal extends LitElement {
         }
 
         const payload = source.slice(sequenceStart + 2, payloadEnd);
-        if (!payload.startsWith('4;')) {
+        // Filter OSC color commands unsupported by ghostty-web allocator path:
+        // 4 = palette, 10/11/12/13 = dynamic foreground/background/cursor colors,
+        // 17/19 = highlight colors, 708 = non-standard dynamic color extension.
+        const oscCommand = payload.split(';', 1)[0] ?? '';
+        const dropOscCommands = new Set(['4', '10', '11', '12', '13', '17', '19', '708']);
+        if (!dropOscCommands.has(oscCommand)) {
           output += source.slice(sequenceStart, sequenceEnd);
         }
 

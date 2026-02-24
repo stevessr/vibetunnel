@@ -268,6 +268,8 @@ struct SessionEntry {
 struct LocalSessionProcess {
     stdin: Option<ChildStdin>,
     pid: u32,
+    cols: u16,
+    rows: u16,
 }
 
 #[derive(Debug, Serialize)]
@@ -6112,19 +6114,19 @@ async fn api_multiplexer_attach(
         let session_id = uuid_like();
         let now = now_iso();
 
-        let mut initial_cols: Option<u16> = None;
-        let mut initial_rows: Option<u16> = None;
-        if let (Some(cols), Some(rows)) = (payload.cols, payload.rows) {
-            if (1..=1000).contains(&cols) && (1..=1000).contains(&rows) {
-                state
-                    .session_dimensions
-                    .lock()
-                    .await
-                    .insert(session_id.clone(), (u32::from(cols), u32::from(rows)));
-                initial_cols = Some(cols);
-                initial_rows = Some(rows);
-            }
-        }
+        let requested_cols = payload.cols.unwrap_or(80).clamp(20, 1000);
+        let requested_rows = payload.rows.unwrap_or(24).clamp(10, 1000);
+
+        state
+            .session_dimensions
+            .lock()
+            .await
+            .insert(
+                session_id.clone(),
+                (u32::from(requested_cols), u32::from(requested_rows)),
+            );
+        let initial_cols: Option<u16> = Some(requested_cols);
+        let initial_rows: Option<u16> = Some(requested_rows);
 
         let entry = SessionEntry {
             id: session_id.clone(),
@@ -7067,10 +7069,12 @@ fn signal_pid(pid: u32, signal: Option<&str>) {
         return;
     }
 
-    let sig = match signal.map(str::trim) {
-        Some("SIGKILL") | Some("KILL") => "-KILL",
-        Some("SIGINT") | Some("INT") => "-INT",
-        Some("SIGTERM") | Some("TERM") | Some("") | None => "-TERM",
+    let normalized = signal.map(str::trim).unwrap_or("TERM").to_ascii_uppercase();
+    let sig = match normalized.as_str() {
+        "SIGKILL" | "KILL" => "-KILL",
+        "SIGINT" | "INT" => "-INT",
+        "SIGWINCH" | "WINCH" => "-WINCH",
+        "SIGTERM" | "TERM" | "" => "-TERM",
         _ => "-TERM",
     };
 
@@ -7148,6 +7152,21 @@ async fn spawn_local_session_process(
         .collect::<Vec<_>>()
         .join(" ");
 
+    let (initial_cols, initial_rows) = {
+        let dimensions = state.session_dimensions.lock().await;
+        dimensions
+            .get(session_id)
+            .copied()
+            .unwrap_or((80, 24))
+    };
+    let initial_cols = initial_cols.clamp(20, 1000) as u16;
+    let initial_rows = initial_rows.clamp(10, 1000) as u16;
+
+    // Ensure child process starts with a safe PTY size (critical for TUI startup)
+    // before the first client-side resize arrives.
+    let stty_prefix = format!("stty cols {} rows {} 2>/dev/null;", initial_cols, initial_rows);
+    let command_line = format!("{} {}", stty_prefix, command_line);
+
     let mut child = TokioCommand::new("script")
         .arg("-q")
         .arg("-e")
@@ -7189,6 +7208,8 @@ async fn spawn_local_session_process(
             LocalSessionProcess {
                 stdin,
                 pid,
+                cols: initial_cols,
+                rows: initial_rows,
             },
         );
     }
@@ -7625,6 +7646,19 @@ async fn api_session_resize(
         .lock()
         .await
         .insert(session_id.clone(), (u32::from(cols), u32::from(rows)));
+
+    {
+        let mut processes = state.local_processes.lock().await;
+        if let Some(process) = processes.get_mut(&session_id) {
+            process.cols = cols;
+            process.rows = rows;
+
+            let _ = ProcessCommand::new("kill")
+                .arg("-WINCH")
+                .arg(process.pid.to_string())
+                .status();
+        }
+    }
 
     Json(serde_json::json!({ "success": true, "cols": cols, "rows": rows })).into_response()
 }
@@ -8213,11 +8247,17 @@ async fn handle_ws(
                                 outputs.get(&frame.session_id).cloned().unwrap_or_default()
                             };
                             let (cols, rows) = {
-                                let dimensions = state.session_dimensions.lock().await;
-                                dimensions
-                                    .get(&frame.session_id)
-                                    .copied()
-                                    .unwrap_or((80, 24))
+                                let processes = state.local_processes.lock().await;
+                                if let Some(process) = processes.get(&frame.session_id) {
+                                    (u32::from(process.cols), u32::from(process.rows))
+                                } else {
+                                    drop(processes);
+                                    let dimensions = state.session_dimensions.lock().await;
+                                    dimensions
+                                        .get(&frame.session_id)
+                                        .copied()
+                                        .unwrap_or((80, 24))
+                                }
                             };
 
                             let snapshot_payload = encode_snapshot_from_output(&output, cols, rows);
@@ -8363,8 +8403,16 @@ async fn handle_ws(
 
                         let mut processes = state.local_processes.lock().await;
                         if let Some(process) = processes.get_mut(&session_id) {
-                            let _ = process.stdin.take();
-                            signal_pid(process.pid, Some(signal.as_str()));
+                            let normalized = signal.trim().to_ascii_uppercase();
+                            if normalized == "WINCH" || normalized == "SIGWINCH" {
+                                let _ = ProcessCommand::new("kill")
+                                    .arg("-WINCH")
+                                    .arg(process.pid.to_string())
+                                    .status();
+                            } else {
+                                let _ = process.stdin.take();
+                                signal_pid(process.pid, Some(signal.as_str()));
+                            }
                         }
                     }
                     WsV3MessageType::Resize => {
@@ -8418,6 +8466,19 @@ async fn handle_ws(
                                 .lock()
                                 .await
                                 .insert(session_id.clone(), (safe_cols, safe_rows));
+
+                            {
+                                let mut processes = state.local_processes.lock().await;
+                                if let Some(process) = processes.get_mut(&session_id) {
+                                    process.cols = safe_cols as u16;
+                                    process.rows = safe_rows as u16;
+
+                                    let _ = ProcessCommand::new("kill")
+                                        .arg("-WINCH")
+                                        .arg(process.pid.to_string())
+                                        .status();
+                                }
+                            }
 
                             let event_payload = serde_json::to_vec(&serde_json::json!({
                                 "kind": "resize",
