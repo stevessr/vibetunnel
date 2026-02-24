@@ -198,6 +198,7 @@ struct AppState {
     push_subscriptions: Arc<Mutex<Vec<PushSubscriptionEntry>>>,
     uploaded_files: Arc<Mutex<Vec<UploadedFileEntry>>>,
     multiplexer_state: Arc<Mutex<MultiplexerState>>,
+    multiplexer_available_cache: Arc<Mutex<MultiplexerAvailabilityCache>>,
     remote_registry: Arc<Mutex<Vec<RemoteServerEntry>>>,
     git_notifications: Arc<Mutex<Vec<GitNotificationEntry>>>,
     git_repo_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
@@ -805,6 +806,12 @@ struct MultiplexerState {
     kitty: Vec<MultiplexerSession>,
 }
 
+#[derive(Debug, Clone)]
+struct MultiplexerAvailabilityCache {
+    values: HashMap<String, bool>,
+    expires_at: Instant,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct RemoteServerEntry {
     id: String,
@@ -886,18 +893,14 @@ async fn main() -> Result<()> {
         push_subscriptions: Arc::new(Mutex::new(Vec::new())),
         uploaded_files: Arc::new(Mutex::new(Vec::new())),
         multiplexer_state: Arc::new(Mutex::new(MultiplexerState {
-            tmux: vec![MultiplexerSession {
-                name: "default".to_string(),
-                session_type: "tmux".to_string(),
-                current: true,
-                attached: false,
-                windows: 1,
-                activity: now_iso(),
-                exited: false,
-            }],
+            tmux: Vec::new(),
             zellij: Vec::new(),
             screen: Vec::new(),
             kitty: Vec::new(),
+        })),
+        multiplexer_available_cache: Arc::new(Mutex::new(MultiplexerAvailabilityCache {
+            values: HashMap::new(),
+            expires_at: Instant::now(),
         })),
         remote_registry: Arc::new(Mutex::new(Vec::new())),
         git_notifications: Arc::new(Mutex::new(Vec::new())),
@@ -2111,13 +2114,18 @@ fn trim_old_git_notifications(entries: &mut Vec<GitNotificationEntry>) {
 }
 
 fn multiplexer_available(command: &str) -> bool {
-    ProcessCommand::new("which")
-        .arg(command)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+    std::env::var_os("PATH")
+        .and_then(|paths| {
+            std::env::split_paths(&paths).find_map(|dir| {
+                let candidate = dir.join(command);
+                if candidate.is_file() {
+                    Some(candidate)
+                } else {
+                    None
+                }
+            })
+        })
+        .is_some()
 }
 
 fn strip_ansi_codes(text: &str) -> String {
@@ -2333,12 +2341,16 @@ fn list_kitty_sessions() -> Vec<MultiplexerSession> {
     sessions
 }
 
-fn default_multiplexer_status(state: &MultiplexerState) -> serde_json::Value {
-    let tmux_available = multiplexer_available("tmux");
-    let zellij_available = multiplexer_available("zellij");
-    let screen_available = multiplexer_available("screen");
-    let kitty_available = multiplexer_available("kitty");
+fn build_multiplexer_status(
+    state: &MultiplexerState,
+    availability: &HashMap<String, bool>,
+) -> serde_json::Value {
+    let tmux_available = availability.get("tmux").copied().unwrap_or(false);
+    let zellij_available = availability.get("zellij").copied().unwrap_or(false);
+    let screen_available = availability.get("screen").copied().unwrap_or(false);
+    let kitty_available = availability.get("kitty").copied().unwrap_or(false);
 
+    let tmux_sessions = if tmux_available { state.tmux.clone() } else { Vec::new() };
     let zellij_sessions = if zellij_available {
         list_zellij_sessions()
     } else {
@@ -2361,7 +2373,7 @@ fn default_multiplexer_status(state: &MultiplexerState) -> serde_json::Value {
         "tmux": {
             "available": tmux_available,
             "type": "tmux",
-            "sessions": state.tmux,
+            "sessions": tmux_sessions,
         },
         "zellij": {
             "available": zellij_available,
@@ -5744,8 +5756,23 @@ async fn api_files_delete(
 }
 
 async fn api_multiplexer_status(State(state): State<AppState>) -> impl IntoResponse {
+    let now = Instant::now();
+
+    let availability = {
+        let mut cache = state.multiplexer_available_cache.lock().await;
+        if cache.values.is_empty() || now >= cache.expires_at {
+            let mut next = HashMap::new();
+            for mux in ["tmux", "zellij", "screen", "kitty"] {
+                next.insert(mux.to_string(), multiplexer_available(mux));
+            }
+            cache.values = next;
+            cache.expires_at = now + Duration::from_secs(15);
+        }
+        cache.values.clone()
+    };
+
     let current = state.multiplexer_state.lock().await.clone();
-    Json(default_multiplexer_status(&current)).into_response()
+    Json(build_multiplexer_status(&current, &availability)).into_response()
 }
 
 async fn api_multiplexer_tmux_windows(
@@ -5834,7 +5861,20 @@ async fn api_multiplexer_create_session(
             .into_response();
     };
 
-    if !multiplexer_available(&mux_type) {
+    let mux_available = {
+        let mut cache = state.multiplexer_available_cache.lock().await;
+        if cache.values.is_empty() || Instant::now() >= cache.expires_at {
+            let mut next = HashMap::new();
+            for mux in ["tmux", "zellij", "screen", "kitty"] {
+                next.insert(mux.to_string(), multiplexer_available(mux));
+            }
+            cache.values = next;
+            cache.expires_at = Instant::now() + Duration::from_secs(15);
+        }
+        cache.values.get(&mux_type).copied().unwrap_or(false)
+    };
+
+    if !mux_available {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": format!("{mux_type} is not available") })),
@@ -6007,7 +6047,20 @@ async fn api_multiplexer_attach(
             .into_response();
     };
 
-    if !multiplexer_available(&mux_type) {
+    let mux_available = {
+        let mut cache = state.multiplexer_available_cache.lock().await;
+        if cache.values.is_empty() || Instant::now() >= cache.expires_at {
+            let mut next = HashMap::new();
+            for mux in ["tmux", "zellij", "screen", "kitty"] {
+                next.insert(mux.to_string(), multiplexer_available(mux));
+            }
+            cache.values = next;
+            cache.expires_at = Instant::now() + Duration::from_secs(15);
+        }
+        cache.values.get(&mux_type).copied().unwrap_or(false)
+    };
+
+    if !mux_available {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": format!("{mux_type} is not available") })),
@@ -6321,7 +6374,20 @@ async fn api_multiplexer_kill_session(
     State(state): State<AppState>,
     AxumPath((mux_type, session_name)): AxumPath<(String, String)>,
 ) -> impl IntoResponse {
-    if !multiplexer_available(&mux_type) {
+    let mux_available = {
+        let mut cache = state.multiplexer_available_cache.lock().await;
+        if cache.values.is_empty() || Instant::now() >= cache.expires_at {
+            let mut next = HashMap::new();
+            for mux in ["tmux", "zellij", "screen", "kitty"] {
+                next.insert(mux.to_string(), multiplexer_available(mux));
+            }
+            cache.values = next;
+            cache.expires_at = Instant::now() + Duration::from_secs(15);
+        }
+        cache.values.get(&mux_type).copied().unwrap_or(false)
+    };
+
+    if !mux_available {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": format!("{mux_type} is not available") })),
@@ -6457,19 +6523,27 @@ async fn api_multiplexer_kill_pane(
         .into_response()
 }
 
-async fn api_multiplexer_context() -> impl IntoResponse {
+async fn api_multiplexer_context(State(state): State<AppState>) -> impl IntoResponse {
+    let now = Instant::now();
+
+    let availability = {
+        let mut cache = state.multiplexer_available_cache.lock().await;
+        if cache.values.is_empty() || now >= cache.expires_at {
+            let mut next = HashMap::new();
+            for mux in ["tmux", "zellij", "screen", "kitty"] {
+                next.insert(mux.to_string(), multiplexer_available(mux));
+            }
+            cache.values = next;
+            cache.expires_at = now + Duration::from_secs(15);
+        }
+        cache.values.clone()
+    };
+
     let mut available = Vec::new();
-    if multiplexer_available("tmux") {
-        available.push("tmux");
-    }
-    if multiplexer_available("zellij") {
-        available.push("zellij");
-    }
-    if multiplexer_available("screen") {
-        available.push("screen");
-    }
-    if multiplexer_available("kitty") {
-        available.push("kitty");
+    for mux in ["tmux", "zellij", "screen", "kitty"] {
+        if availability.get(mux).copied().unwrap_or(false) {
+            available.push(mux);
+        }
     }
 
     Json(serde_json::json!({

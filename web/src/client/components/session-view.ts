@@ -1203,8 +1203,7 @@ export class SessionView extends LitElement {
               "quickkeys";
             grid-template-rows: auto 1fr auto;
             grid-template-columns: 1fr;
-            height: 100vh;
-            height: 100dvh;
+            height: var(--app-height, 100dvh);
             width: 100%;
             max-width: 100vw;
             position: relative;
@@ -1218,8 +1217,7 @@ export class SessionView extends LitElement {
           
           /* Adjust grid when keyboard is visible */
           .session-view-grid[data-keyboard-visible="true"] {
-            height: calc(100vh - var(--keyboard-height, 0px) - var(--quickkeys-height, 0px));
-            height: calc(100dvh - var(--keyboard-height, 0px) - var(--quickkeys-height, 0px));
+            height: calc(var(--app-height, 100dvh) - var(--keyboard-height, 0px) - var(--quickkeys-height, 0px));
             transition: height 0.2s ease-out;
           }
           
@@ -1249,8 +1247,8 @@ export class SessionView extends LitElement {
           /* Desktop: Keep existing terminal behavior */
           .terminal-area vibe-terminal,
           .terminal-area vibe-terminal-binary {
-            height: calc(100% + 50px) !important;
-            margin-bottom: -50px !important;
+            height: 100% !important;
+            margin-bottom: 0 !important;
           }
           
           /* Desktop: Keep transform for quick keys */
@@ -1285,8 +1283,7 @@ export class SessionView extends LitElement {
             /* Use mobile-terminal-container styles */
             display: flex !important;
             flex-direction: column !important;
-            height: 100vh !important;
-            height: 100dvh !important;
+            height: var(--app-height, 100dvh) !important;
             width: 100% !important;
             position: relative !important;
             overflow: hidden !important;
@@ -1375,7 +1372,7 @@ export class SessionView extends LitElement {
       <div class="bg-bg-secondary" style="padding-top: env(safe-area-inset-top);">
         <div
           class="session-view-grid"
-          style="outline: none !important; box-shadow: none !important; --keyboard-height: ${uiState.keyboardHeight}px; --quickkeys-height: 0px; --mobile-bottom-offset: 0px;"
+          style="outline: none !important; box-shadow: none !important; --app-height: var(--app-height, 100dvh); --keyboard-height: ${uiState.keyboardHeight}px; --quickkeys-height: 0px; --mobile-bottom-offset: 0px;"
           data-keyboard-visible="${uiState.keyboardHeight > 0 || uiState.showQuickKeys || uiState.showMobileInput ? 'true' : 'false'}"
         >
         <!-- Session Header Area -->

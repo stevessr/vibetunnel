@@ -85,7 +85,7 @@ export class MultiplexerModal extends LitElement {
       // Get status of all multiplexers
       const statusResponse = await withTimeout(
         apiClient.get<MultiplexerStatus>('/multiplexer/status'),
-        8000,
+        12000,
         'Loading multiplexer status'
       );
       this.multiplexerStatus = statusResponse;
