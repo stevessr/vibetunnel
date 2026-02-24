@@ -7611,6 +7611,9 @@ async fn api_session_resize(
             .into_response();
     }
 
+    let cols = cols.max(20);
+    let rows = rows.max(10);
+
     {
         let mut sessions = state.sessions.lock().await;
         if let Some(session) = sessions.iter_mut().find(|s| s.id == session_id.as_str()) {
@@ -8399,13 +8402,16 @@ async fn handle_ws(
 
                         if let Some(resize) = vibetunnel_rs::protocol::ws_v3::decode_resize_payload(&payload)
                         {
+                            let safe_cols = resize.cols.clamp(20, 1000);
+                            let safe_rows = resize.rows.clamp(10, 1000);
+
                             {
                                 let mut sessions = state.sessions.lock().await;
                                 if let Some(session) =
                                     sessions.iter_mut().find(|s| s.id == session_id.as_str())
                                 {
-                                    session.initial_cols = u16::try_from(resize.cols).ok();
-                                    session.initial_rows = u16::try_from(resize.rows).ok();
+                                    session.initial_cols = u16::try_from(safe_cols).ok();
+                                    session.initial_rows = u16::try_from(safe_rows).ok();
                                     session.last_modified = now_iso();
                                 }
                             }
@@ -8414,14 +8420,14 @@ async fn handle_ws(
                                 .session_dimensions
                                 .lock()
                                 .await
-                                .insert(session_id.clone(), (resize.cols, resize.rows));
+                                .insert(session_id.clone(), (safe_cols, safe_rows));
 
                             let event_payload = serde_json::to_vec(&serde_json::json!({
                                 "kind": "resize",
                                 "sessionId": session_id,
                                 "dimensions": {
-                                    "cols": resize.cols,
-                                    "rows": resize.rows,
+                                    "cols": safe_cols,
+                                    "rows": safe_rows,
                                 },
                             }))
                             .unwrap_or_default();

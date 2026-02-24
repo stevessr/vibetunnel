@@ -17,7 +17,7 @@ import type { InputManager } from './input-manager.js';
 
 const logger = createLogger('terminal-lifecycle-manager');
 const MIN_SAFE_COLS = 20;
-const MIN_SAFE_ROWS = 6;
+const MIN_SAFE_ROWS = 10;
 const TUIS_RECOMMENDED_ROWS = 10;
 const TUIS_RECOMMENDED_COLS = 80;
 
