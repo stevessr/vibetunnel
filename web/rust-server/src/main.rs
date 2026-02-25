@@ -26,6 +26,7 @@ use axum::{
     Json, Router,
 };
 use clap::{Parser, Subcommand};
+use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
@@ -34,11 +35,7 @@ use tokio::{
     task::JoinHandle,
     time::{interval, interval_at, Instant as TokioInstant},
 };
-use tower_http::{
-    compression::CompressionLayer,
-    services::{ServeDir, ServeFile},
-    set_header::SetResponseHeaderLayer,
-};
+use tower_http::{compression::CompressionLayer, set_header::SetResponseHeaderLayer};
 use vibetunnel_rs::protocol::{
     snapshot,
     ws_v3::{
@@ -866,6 +863,10 @@ struct AuthContext {
     is_hq_request: bool,
 }
 
+#[derive(RustEmbed)]
+#[folder = "../public"]
+struct EmbeddedAssets;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -1000,31 +1001,6 @@ fn default_port() -> u16 {
 
 fn default_bind() -> String {
     std::env::var("BIND_ADDRESS").unwrap_or_else(|_| "127.0.0.1".to_string())
-}
-
-fn get_public_path() -> PathBuf {
-    if let Ok(build_public) = std::env::var("BUILD_PUBLIC_PATH") {
-        if !build_public.trim().is_empty() {
-            return PathBuf::from(build_public);
-        }
-    }
-
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let web_root = manifest_dir.parent().unwrap_or_else(|| Path::new("."));
-
-    let candidates = [
-        web_root.join("public"),
-        web_root.join("dist/public"),
-        web_root.join("lib/public"),
-    ];
-
-    for candidate in candidates {
-        if candidate.exists() {
-            return candidate;
-        }
-    }
-
-    web_root.join("public")
 }
 
 fn now_iso() -> String {
@@ -1980,6 +1956,7 @@ fn detect_mime_from_path(file_path: &Path) -> &'static str {
         "js" => "application/javascript",
         "ts" => "application/typescript",
         "xml" => "application/xml",
+        "wasm" => "application/wasm",
         "html" | "htm" => "text/html",
         "css" => "text/css",
         "md" => "text/markdown",
@@ -2396,11 +2373,7 @@ fn build_multiplexer_status(
 }
 
 fn build_app(state: AppState) -> Router {
-    let public_path = get_public_path();
     let _features_enabled = use_remaining_config(&state.config);
-    let static_service = ServeDir::new(public_path.clone()).not_found_service(ServeFile::new(
-        public_path.join("404.html"),
-    ));
 
     let api = Router::new()
         .route("/health", get(api_health))
@@ -2529,7 +2502,7 @@ fn build_app(state: AppState) -> Router {
         .route("/session/{id}", get(serve_index))
         .route("/worktrees", get(serve_index))
         .route("/file-browser", get(serve_index))
-        .fallback_service(static_service)
+        .fallback(serve_embedded_asset)
         .layer(CompressionLayer::new())
         .layer(SetResponseHeaderLayer::if_not_present(
             header::CACHE_CONTROL,
@@ -8746,17 +8719,56 @@ async fn broadcast_to_session(
     }
 }
 
-async fn serve_index() -> impl IntoResponse {
-    match tokio::fs::read_to_string(get_public_path().join("index.html")).await {
-        Ok(html) => axum::response::Html(html).into_response(),
-        Err(_) => (
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: "index.html not found".to_string(),
-            }),
-        )
-            .into_response(),
+fn embedded_asset_path(uri_path: &str) -> String {
+    let trimmed = uri_path.trim_start_matches('/');
+    if trimmed.is_empty() {
+        "index.html".to_string()
+    } else {
+        trimmed.to_string()
     }
+}
+
+fn embedded_asset_response(asset_path: &str) -> Response {
+    if let Some(content) = EmbeddedAssets::get(asset_path) {
+        let mime_type = detect_mime_from_path(Path::new(asset_path));
+        return ([(header::CONTENT_TYPE, mime_type)], content.data).into_response();
+    }
+
+    if let Some(not_found) = EmbeddedAssets::get("404.html") {
+        return (
+            StatusCode::NOT_FOUND,
+            [(header::CONTENT_TYPE, "text/html")],
+            not_found.data,
+        )
+            .into_response();
+    }
+
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse {
+            error: "Not found".to_string(),
+        }),
+    )
+        .into_response()
+}
+
+async fn serve_index() -> impl IntoResponse {
+    if let Some(html) = EmbeddedAssets::get("index.html") {
+        return ([(header::CONTENT_TYPE, "text/html")], html.data).into_response();
+    }
+
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse {
+            error: "index.html not found".to_string(),
+        }),
+    )
+        .into_response()
+}
+
+async fn serve_embedded_asset(uri: axum::http::Uri) -> impl IntoResponse {
+    let asset_path = embedded_asset_path(uri.path());
+    embedded_asset_response(&asset_path)
 }
 
 fn uuid_like() -> String {
