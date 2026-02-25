@@ -1,82 +1,97 @@
-# Claude Development Notes
+# CLAUDE.md
 
-## Build Process
-- **Never run build commands**
-- the user has `pnpm run dev` running which handles automatic rebuilds, either directly or via the mac app
-- Never manually run the server. The user does that
-- Changes to TypeScript files are automatically compiled and watched
-- Do not run `pnpm run build` or similar build commands
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Development Workflow
-- Make changes to source files in `src/`
-- **ALWAYS run code quality checks before committing:**
-    - `pnpm run check` - Run all checks (format, lint, typecheck) in parallel
-    - This is the ONLY command you need to run for checking
-    - It runs everything concurrently for maximum speed
-- **If there are issues to fix:**
-    - `pnpm run check:fix` - Auto-fix formatting and linting issues (runs sequentially to avoid conflicts)
-- **Individual commands (rarely needed):**
-    - `pnpm run format` / `pnpm run format:check`
-    - `pnpm run lint` / `pnpm run lint:fix`
-    - `pnpm run typecheck`
-- Always fix all linting and type checking errors, including in unrelated code
-- Never run the tests, unless explicitly asked to. `pnpm run test`
+## Scope
+This file applies to the `web/` workspace (TypeScript server/client plus optional Rust runtime).
 
-## Code References
-**THIS IS OF UTTER IMPORTANCE THE USERS HAPPINESS DEPENDS ON IT!**
-When referencing code locations, you MUST use clickable format that VS Code recognizes:
-- `path/to/file.ts:123` format (file:line)
-- `path/to/file.ts:123-456` (ranges)
-- Always use relative paths from the project root
-- Examples:
-  - `src/cli.ts:92` - single line reference
-  - `src/server/pty/pty-manager.ts:274-280` - line range
-  - `web/src/client/app.ts:15` - when in parent directory
+## Required workflow constraints
+- The user usually has dev/watch processes running already.
+  - Do not start or restart the server unless explicitly asked.
+  - Do not run build commands unless explicitly asked.
+- Do not run tests unless explicitly asked.
+- Do not install new packages without explicit approval.
+  - Do not run `pnpm add` / `npm install` for new deps.
+  - Do not modify `package.json` or lockfiles for dependency changes unless requested.
+- Keep references clickable in `path/to/file:line` or `path/to/file:start-end` format.
 
-NEVER give a code reference or location in any other format.
+## Common commands
+Use `pnpm` from `web/`.
 
-## Git Commands
-When asked to "commit and push", "commit + push", "/cp", or "c+p", use a single command:
-```bash
-git add -A && git commit -m "commit message" && git push
-```
-Do NOT use three separate commands (add, commit, push) as this is slow.
+### Development
+- `pnpm install`
+- `pnpm run dev` (full dev flow)
+- `pnpm run dev:mobile` (binds `0.0.0.0:4021` for external device testing)
+- `pnpm run dev:server` (TS server only)
+- `pnpm run dev:server:rust` (Rust server only)
+- `pnpm run dev:client` (client-only mode)
 
-## Refactoring Philosophy
-- We do not care about deprecation - remove old code completely
-- Always prefer clean refactoring over gradual migration
-- Delete unused functions and code paths immediately
-- **We do not care about backwards compatibility** - Everything is shipped together
-- No need to support "older UI versions" - the web UI and server are always deployed as a unit
+### Quality checks
+- `pnpm run check` (format check + lint + type-aware lint + typecheck + vt script test)
+- `pnpm run check:fix` (auto-fix formatting/lint then re-check)
 
-## Best Practices
-- ALWAYS use `Z_INDEX` constants in `src/client/utils/constants.ts` instead of setting z-index properties using primitives / magic numbers
-- Add ids to web elements whenever needed to make testing simpler. This helps avoid complex selectors that search by text content or traverse the DOM
-  - Use descriptive IDs like `session-kill-button`, `show-exited-button`, `file-picker-choose-button`
-  - Prefer ID selectors (`#element-id`) over complex queries in tests
-  - When adding interactive elements (buttons, inputs), always consider adding an ID for testability
+### Tests (run only when asked)
+- `pnpm run test`
+- `pnpm run test:server`
+- `pnpm run test:client`
+- Single Vitest file: `pnpm exec vitest run src/test/unit/ws-v3.test.ts`
+- Single Vitest test name: `pnpm exec vitest run src/test/unit/ws-v3.test.ts -t "encode"`
+- `pnpm run test:e2e`
+- Single Playwright spec: `pnpm exec playwright test src/test/playwright/specs/smoke.spec.ts`
+- Single Playwright test name: `pnpm exec playwright test src/test/playwright/specs/smoke.spec.ts -g "session"`
+- Rust runtime tests: `cargo test --manifest-path rust-server/Cargo.toml`
 
-## CRITICAL: Package Installation Policy
-**NEVER install packages without explicit user approval!**
-- Do NOT run `pnpm add`, `npm install`, or any package installation commands
-- Do NOT modify `package.json` or `pnpm-lock.yaml` unless explicitly requested
-- Always ask for permission before suggesting new dependencies
-- Understand and work with the existing codebase architecture first
-- This project has custom implementations - don't assume we need standard packages
+### Build/reference commands (only when asked)
+- `pnpm run build`
+- `pnpm run build:rust`
+- `pnpm run build:npm`
+- `pnpm run build:npm:rust`
 
-## CRITICAL: vt Command in package.json
-**IMPORTANT: DO NOT add "vt": "./bin/vt" to the bin section of package.json or package.npm.json!**
-- The vt command must NOT be registered as a global binary in package.json
-- This is because it conflicts with other tools that use 'vt' (there are many)
-- Instead, vt is conditionally installed via postinstall script only if available
-- The postinstall script checks if vt already exists before creating a symlink
+## Architecture map (big picture)
 
-## CRITICAL: Playwright Test UI Changes
-**IMPORTANT: When tests fail looking for UI elements, investigate the actual UI structure!**
+### Entry points and runtime selection
+- CLI entry and command dispatch: `src/cli.ts:292-327`
+  - `vibetunnel fwd/status/follow/unfollow/git-event/systemd` are handled here.
+  - Default path starts server via `startVibeTunnelServer()` (`src/cli.ts:281-287`).
+- Main server assembly: `src/server/server.ts:452-1350` (`createApp`).
+- Server bootstrap: `src/server/server.ts:1628-1656` (`startVibeTunnelServer`).
+- Client bootstrap: `src/client/app-entry.ts:1-8`.
+- Main app shell: `src/client/app.ts:49-74` (`<vibetunnel-app>` with top-level state).
+- Rust runtime exists as alternative server at `rust-server/src/main.rs` and is selected by `VIBETUNNEL_USE_RUST_SERVER=1` / `--rust-server` in scripts.
 
-### Best Practices for Test Stability
-1. **Always use semantic IDs and data-testid attributes** - These are more stable than CSS selectors
-2. **Understand the UI structure** - Don't just increase timeouts, investigate why elements aren't found
-3. **Check for collapsible/expandable sections** - Many elements are now hidden by default
-4. **Wait for animations** - After expanding sections, wait briefly for animations to complete
-5. **Use proper element states** - Wait for 'visible' not just 'attached' for interactive elements
+### Server composition
+- `createApp` wires core services:
+  - `PtyManager` + `SessionManager` for PTY/session lifecycle and persistence.
+  - `TerminalManager` for Ghostty-based headless terminal snapshots.
+  - `CastOutputHub` + `GitStatusHub` for event/output fanout.
+  - `WsV3Hub` for `/ws` binary multiplexed transport.
+- Route mounting happens in `src/server/server.ts:1061-1153` using route modules under `src/server/routes/`.
+- Static/SPA behavior is in `src/server/server.ts:745-851` and `src/server/server.ts:1318-1348`.
+
+### PTY/session data flow
+1. Session creation and PTY process management: `src/server/pty/pty-manager.ts:123-161`.
+2. Session persistence under control dir (`~/.vibetunnel/control/...`): `src/server/pty/session-manager.ts:16-24`, `src/server/pty/session-manager.ts:146-169`.
+3. WebSocket v3 framing contract: `src/shared/ws-v3.ts:1-37`.
+4. WS v3 server hub handles subscribe/input/resize/kill and emits stdout/snapshot/event frames: `src/server/services/ws-v3-hub.ts:57-192`.
+5. Client WebSocket multiplexer with reconnect + per-session subscriptions: `src/client/services/terminal-socket-client.ts:50-157`.
+
+### API shape
+- Session/API routes are modularized (auth/sessions/git/filesystem/worktrees/multiplexer/tmux/etc.).
+- A representative aggregation point is `src/server/routes/sessions.ts:48-240`.
+- `/ws` upgrade/auth routing is in `src/server/server.ts:1175-1316`.
+
+### Client structure
+- `src/client/app.ts` is the orchestration layer for auth/session/file-browser views.
+- UI is componentized under `src/client/components/*`.
+- Service layer under `src/client/services/*` handles auth, server events, WebSocket terminal transport, and push notifications.
+
+## Important project-specific conventions
+- Use `Z_INDEX` constants from `src/client/utils/constants.ts` instead of hardcoded z-index values.
+- Prefer stable element IDs/data-testid for testability on interactive UI.
+- Do not add `"vt": "./bin/vt"` to `package.json`/`package.npm.json` `bin` section.
+
+## Key docs to consult
+- Architecture/API overview: `docs/spec.md`
+- IPC framing for Unix socket control channel: `docs/socket-protocol.md`
+- Playwright patterns used in this repo: `docs/playwright-testing.md`
+- Rust runtime build/deploy flow: `docs/rust-server-deployment.md`

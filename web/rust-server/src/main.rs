@@ -757,6 +757,18 @@ struct WorktreeEntry {
     locked_reason: Option<String>,
 }
 
+#[derive(Debug)]
+struct HookInstallResult {
+    success: bool,
+    error: Option<String>,
+}
+
+#[derive(Debug)]
+struct HookUninstallResult {
+    success: bool,
+    error: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 struct BranchEntry {
     name: String,
@@ -1473,6 +1485,216 @@ fn parse_worktree_porcelain(output: &str) -> Vec<WorktreeEntry> {
     }
 
     worktrees
+}
+
+fn get_hooks_directory(repo_path: &Path) -> PathBuf {
+    if let Ok((stdout, _)) = run_git(
+        repo_path,
+        vec!["config".to_string(), "core.hooksPath".to_string()],
+    ) {
+        let custom_path = stdout.trim();
+        if !custom_path.is_empty() {
+            return if Path::new(custom_path).is_absolute() {
+                PathBuf::from(custom_path)
+            } else {
+                repo_path.join(custom_path)
+            };
+        }
+    }
+
+    repo_path.join(".git").join("hooks")
+}
+
+fn hook_script_content(hook_type: &str) -> String {
+    format!(
+        "#!/bin/sh\n# VibeTunnel Git hook - {hook_type}\n# This hook notifies VibeTunnel when Git events occur\n\n# Check if vt command is available\nif command -v vt >/dev/null 2>&1; then\n  # Run in background to avoid blocking Git operations\n  vt git event &\nfi\n\n# Always exit successfully\nexit 0\n"
+    )
+}
+
+fn hook_script_with_backup(hook_type: &str, backup_path: &Path) -> String {
+    format!(
+        "#!/bin/sh\n# VibeTunnel Git hook - {hook_type}\n# This hook notifies VibeTunnel when Git events occur\n\n# Check if vt command is available\nif command -v vt >/dev/null 2>&1; then\n  # Run in background to avoid blocking Git operations\n  vt git event &\nfi\n\n# Execute the original hook if it exists\nif [ -f \"{}\" ]; then\n  exec \"{}\" \"$@\"\nfi\n\nexit 0\n",
+        backup_path.display(),
+        backup_path.display()
+    )
+}
+
+fn install_hook(repo_path: &Path, hook_type: &str) -> HookInstallResult {
+    let hooks_dir = get_hooks_directory(repo_path);
+    let hook_path = hooks_dir.join(hook_type);
+    let backup_path = PathBuf::from(format!("{}.vtbak", hook_path.display()));
+
+    if let Err(error) = fs::create_dir_all(&hooks_dir) {
+        return HookInstallResult {
+            success: false,
+            error: Some(error.to_string()),
+        };
+    }
+
+    let existing_hook = fs::read_to_string(&hook_path).ok();
+
+    if existing_hook
+        .as_ref()
+        .is_some_and(|content| content.contains("VibeTunnel Git hook"))
+    {
+        return HookInstallResult {
+            success: true,
+            error: None,
+        };
+    }
+
+    if let Some(content) = existing_hook.as_ref() {
+        if let Err(error) = fs::write(&backup_path, content) {
+            return HookInstallResult {
+                success: false,
+                error: Some(error.to_string()),
+            };
+        }
+    }
+
+    let script = if existing_hook.is_some() {
+        hook_script_with_backup(hook_type, &backup_path)
+    } else {
+        hook_script_content(hook_type)
+    };
+
+    if let Err(error) = fs::write(&hook_path, script) {
+        return HookInstallResult {
+            success: false,
+            error: Some(error.to_string()),
+        };
+    }
+
+    if let Err(error) = fs::set_permissions(&hook_path, fs::Permissions::from_mode(0o755)) {
+        return HookInstallResult {
+            success: false,
+            error: Some(error.to_string()),
+        };
+    }
+
+    HookInstallResult {
+        success: true,
+        error: None,
+    }
+}
+
+fn uninstall_hook(repo_path: &Path, hook_type: &str) -> HookUninstallResult {
+    let hooks_dir = get_hooks_directory(repo_path);
+    let hook_path = hooks_dir.join(hook_type);
+    let backup_path = PathBuf::from(format!("{}.vtbak", hook_path.display()));
+
+    let existing_hook = match fs::read_to_string(&hook_path) {
+        Ok(content) => content,
+        Err(_) => {
+            return HookUninstallResult {
+                success: true,
+                error: None,
+            }
+        }
+    };
+
+    if !existing_hook.contains("VibeTunnel Git hook") {
+        return HookUninstallResult {
+            success: true,
+            error: None,
+        };
+    }
+
+    if backup_path.exists() {
+        let backup_content = match fs::read_to_string(&backup_path) {
+            Ok(content) => content,
+            Err(error) => {
+                return HookUninstallResult {
+                    success: false,
+                    error: Some(error.to_string()),
+                }
+            }
+        };
+
+        if let Err(error) = fs::write(&hook_path, backup_content) {
+            return HookUninstallResult {
+                success: false,
+                error: Some(error.to_string()),
+            };
+        }
+
+        if let Err(error) = fs::set_permissions(&hook_path, fs::Permissions::from_mode(0o755)) {
+            return HookUninstallResult {
+                success: false,
+                error: Some(error.to_string()),
+            };
+        }
+
+        if let Err(error) = fs::remove_file(&backup_path) {
+            return HookUninstallResult {
+                success: false,
+                error: Some(error.to_string()),
+            };
+        }
+
+        return HookUninstallResult {
+            success: true,
+            error: None,
+        };
+    }
+
+    if let Err(error) = fs::remove_file(&hook_path) {
+        return HookUninstallResult {
+            success: false,
+            error: Some(error.to_string()),
+        };
+    }
+
+    HookUninstallResult {
+        success: true,
+        error: None,
+    }
+}
+
+fn are_hooks_installed(repo_path: &Path) -> bool {
+    let hooks_dir = get_hooks_directory(repo_path);
+    ["post-commit", "post-checkout"].iter().all(|hook_type| {
+        let hook_path = hooks_dir.join(hook_type);
+        fs::read_to_string(&hook_path)
+            .map(|content| content.contains("VibeTunnel Git hook"))
+            .unwrap_or(false)
+    })
+}
+
+fn install_git_hooks(repo_path: &Path) -> Result<(), Vec<String>> {
+    let results = [
+        install_hook(repo_path, "post-commit"),
+        install_hook(repo_path, "post-checkout"),
+    ];
+
+    let errors: Vec<String> = results
+        .into_iter()
+        .filter_map(|result| if result.success { None } else { result.error })
+        .collect();
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+fn uninstall_git_hooks(repo_path: &Path) -> Result<(), Vec<String>> {
+    let results = [
+        uninstall_hook(repo_path, "post-commit"),
+        uninstall_hook(repo_path, "post-checkout"),
+    ];
+
+    let errors: Vec<String> = results
+        .into_iter()
+        .filter_map(|result| if result.success { None } else { result.error })
+        .collect();
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
 }
 
 fn detect_default_branch(repo_path: &Path) -> String {
@@ -4519,7 +4741,10 @@ async fn api_prune_worktrees(Json(payload): Json<PruneWorktreesRequest>) -> impl
     }
 }
 
-async fn api_follow_worktrees(Json(payload): Json<FollowWorktreesRequest>) -> impl IntoResponse {
+async fn api_follow_worktrees(
+    State(state): State<AppState>,
+    Json(payload): Json<FollowWorktreesRequest>,
+) -> impl IntoResponse {
     let Some(repo_path) = payload.repo_path.filter(|p| !p.trim().is_empty()) else {
         return (
             StatusCode::BAD_REQUEST,
@@ -4548,6 +4773,29 @@ async fn api_follow_worktrees(Json(payload): Json<FollowWorktreesRequest>) -> im
 
     if enable {
         let branch = payload.branch.unwrap_or_default();
+
+        let hooks_already_installed = are_hooks_installed(&absolute_repo_path);
+        let mut hooks_install_result = serde_json::Value::Null;
+
+        if !hooks_already_installed {
+            match install_git_hooks(&absolute_repo_path) {
+                Ok(()) => {
+                    hooks_install_result = serde_json::json!({
+                        "success": true,
+                    });
+                }
+                Err(errors) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({
+                            "error": "Failed to install Git hooks",
+                            "details": errors,
+                        })),
+                    )
+                        .into_response();
+                }
+            }
+        }
 
         let worktree_list = match run_git(
             &absolute_repo_path,
@@ -4637,18 +4885,33 @@ async fn api_follow_worktrees(Json(payload): Json<FollowWorktreesRequest>) -> im
             }
         }
 
+        let repo_name = absolute_repo_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("repository");
+        let mut notifications = state.git_notifications.lock().await;
+        notifications.push(GitNotificationEntry {
+            timestamp_ms: now_unix_ms(),
+            notification: GitUiNotification {
+                level: "info".to_string(),
+                title: "Follow Mode Enabled".to_string(),
+                message: format!("Now following branch '{}' in {}", branch, repo_name),
+            },
+        });
+        trim_old_git_notifications(&mut notifications);
+
         return Json(serde_json::json!({
             "success": true,
             "enabled": true,
             "message": "Follow mode enabled",
             "branch": branch,
             "hooksInstalled": true,
-            "hooksInstallResult": serde_json::Value::Null,
+            "hooksInstallResult": hooks_install_result,
         }))
         .into_response();
     }
 
-    match run_git(
+    let unset_result = run_git(
         &absolute_repo_path,
         vec![
             "config".to_string(),
@@ -4656,28 +4919,57 @@ async fn api_follow_worktrees(Json(payload): Json<FollowWorktreesRequest>) -> im
             "--unset".to_string(),
             "vibetunnel.followWorktree".to_string(),
         ],
-    ) {
-        Ok(_) => Json(serde_json::json!({
+    );
+
+    if let Err(error) = unset_result {
+        if !is_git_config_not_found_error(&error) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "Failed to manage follow mode",
+                    "details": if error.stderr.is_empty() { error.message } else { error.stderr },
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    let hooks_uninstall_result = uninstall_git_hooks(&absolute_repo_path);
+
+    let repo_name = absolute_repo_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("repository");
+    let mut notifications = state.git_notifications.lock().await;
+    notifications.push(GitNotificationEntry {
+        timestamp_ms: now_unix_ms(),
+        notification: GitUiNotification {
+            level: "info".to_string(),
+            title: "Follow Mode Disabled".to_string(),
+            message: format!("Follow mode has been disabled for {}", repo_name),
+        },
+    });
+    trim_old_git_notifications(&mut notifications);
+
+    match hooks_uninstall_result {
+        Ok(()) => Json(serde_json::json!({
             "success": true,
             "enabled": false,
             "message": "Follow mode disabled",
             "branch": payload.branch,
         }))
         .into_response(),
-        Err(error) if is_git_config_not_found_error(&error) => Json(serde_json::json!({
+        Err(errors) => Json(serde_json::json!({
             "success": true,
             "enabled": false,
             "message": "Follow mode disabled",
+            "branch": payload.branch,
+            "hooksUninstallResult": {
+                "success": false,
+                "errors": errors,
+            },
         }))
         .into_response(),
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": "Failed to manage follow mode",
-                "details": if error.stderr.is_empty() { error.message } else { error.stderr },
-            })),
-        )
-            .into_response(),
     }
 }
 
@@ -8864,6 +9156,41 @@ mod tests {
         assert!(loaded.notification_preferences.is_some());
 
         let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn install_and_uninstall_git_hooks_roundtrip_preserves_existing_hook() {
+        let repo_root = std::env::temp_dir().join(format!("vt-rs-hook-test-{}", uuid_like()));
+        let hooks_dir = repo_root.join(".git/hooks");
+        std::fs::create_dir_all(&hooks_dir).expect("create hooks dir");
+
+        let post_commit_path = hooks_dir.join("post-commit");
+        let original_hook = "#!/bin/sh\necho original\n";
+        std::fs::write(&post_commit_path, original_hook).expect("write original hook");
+        std::fs::set_permissions(&post_commit_path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod original hook");
+
+        let install_result = install_git_hooks(&repo_root);
+        assert!(install_result.is_ok());
+        assert!(are_hooks_installed(&repo_root));
+
+        let installed_hook =
+            std::fs::read_to_string(&post_commit_path).expect("read installed post-commit hook");
+        assert!(installed_hook.contains("VibeTunnel Git hook"));
+        assert!(installed_hook.contains(".vtbak"));
+
+        let backup_path = hooks_dir.join("post-commit.vtbak");
+        assert!(backup_path.exists());
+
+        let uninstall_result = uninstall_git_hooks(&repo_root);
+        assert!(uninstall_result.is_ok());
+
+        let restored_hook =
+            std::fs::read_to_string(&post_commit_path).expect("read restored post-commit hook");
+        assert_eq!(restored_hook, original_hook);
+        assert!(!backup_path.exists());
+
+        let _ = std::fs::remove_dir_all(repo_root);
     }
 
 }
