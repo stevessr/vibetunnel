@@ -30,13 +30,15 @@ use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
+    net::{UnixListener, UnixStream},
     process::{ChildStdin, Command as TokioCommand},
-    sync::Mutex,
+    sync::{mpsc, Mutex},
     task::JoinHandle,
     time::{interval, interval_at, Instant as TokioInstant},
 };
 use tower_http::{compression::CompressionLayer, set_header::SetResponseHeaderLayer};
 use vibetunnel_rs::protocol::{
+    control_sock::{encode_control_message, ControlMessageParser},
     snapshot,
     ws_v3::{
         decode_frame, decode_subscribe_payload, encode_frame, WsV3Frame, WsV3MessageType,
@@ -199,6 +201,7 @@ struct AppState {
     remote_registry: Arc<Mutex<Vec<RemoteServerEntry>>>,
     git_notifications: Arc<Mutex<Vec<GitNotificationEntry>>>,
     git_repo_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    control_socket: Arc<ControlSocketState>,
 }
 
 #[derive(Debug, Clone)]
@@ -431,6 +434,10 @@ struct SessionCreateRequest {
     name: Option<String>,
     cols: Option<u16>,
     rows: Option<u16>,
+    #[serde(rename = "spawn_terminal")]
+    spawn_terminal: Option<bool>,
+    #[serde(rename = "titleMode")]
+    title_mode: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -567,6 +574,42 @@ struct PushTestRequest {
 #[derive(Debug, Deserialize)]
 struct GitPathQuery {
     path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DetectGitInfoResponse {
+    git_repo_path: Option<String>,
+    git_branch: Option<String>,
+    git_ahead_count: Option<u32>,
+    git_behind_count: Option<u32>,
+    git_has_changes: Option<bool>,
+    git_is_worktree: Option<bool>,
+    git_main_repo_path: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalSpawnPayload {
+    session_id: Option<String>,
+    working_directory: Option<String>,
+    command: Option<String>,
+    terminal_preference: Option<String>,
+    git_repo_path: Option<String>,
+    git_branch: Option<String>,
+    git_ahead_count: Option<u32>,
+    git_behind_count: Option<u32>,
+    git_has_changes: Option<bool>,
+    git_is_worktree: Option<bool>,
+    git_main_repo_path: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalSpawnResponsePayload {
+    success: bool,
+    pid: Option<u32>,
+    error: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -745,6 +788,31 @@ struct PushSubscriptionEntry {
     is_active: bool,
 }
 
+#[derive(Debug)]
+struct ControlSocketState {
+    mac_sender: Mutex<Option<mpsc::UnboundedSender<Vec<u8>>>>,
+    listener_task: Mutex<Option<JoinHandle<()>>>,
+    pending_requests: Mutex<HashMap<String, tokio::sync::oneshot::Sender<ControlMessage>>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ControlMessage {
+    id: String,
+    #[serde(rename = "type")]
+    message_type: String,
+    category: String,
+    action: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    payload: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 struct WorktreeEntry {
     path: String,
@@ -920,7 +988,16 @@ async fn main() -> Result<()> {
         remote_registry: Arc::new(Mutex::new(Vec::new())),
         git_notifications: Arc::new(Mutex::new(Vec::new())),
         git_repo_locks: Arc::new(Mutex::new(HashMap::new())),
+        control_socket: Arc::new(ControlSocketState {
+            mac_sender: Mutex::new(None),
+            listener_task: Mutex::new(None),
+            pending_requests: Mutex::new(HashMap::new()),
+        }),
     };
+
+    if let Err(error) = start_control_socket_listener(state.clone()).await {
+        eprintln!("Failed to initialize control socket: {error:#}");
+    }
 
     let app = build_app(state);
 
@@ -2137,17 +2214,20 @@ fn is_symlink(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn uploads_directory() -> PathBuf {
+fn control_directory() -> PathBuf {
     if let Ok(control_dir) = std::env::var("VIBETUNNEL_CONTROL_DIR") {
-        PathBuf::from(control_dir).join("uploads")
+        PathBuf::from(control_dir)
     } else {
         std::env::var("HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("."))
             .join(".vibetunnel")
             .join("control")
-            .join("uploads")
     }
+}
+
+fn uploads_directory() -> PathBuf {
+    control_directory().join("uploads")
 }
 
 fn sanitize_filename(name: &str) -> bool {
@@ -3123,7 +3203,7 @@ async fn api_health(State(state): State<AppState>) -> impl IntoResponse {
 
 async fn api_server_status(State(state): State<AppState>) -> impl IntoResponse {
     Json(ServerStatusResponse {
-        mac_app_connected: true,
+        mac_app_connected: is_mac_app_connected(&state).await,
         is_hq_mode: state.config.is_hq_mode,
         version: state.config.version,
     })
@@ -4257,19 +4337,29 @@ async fn api_git_event(
 
     let notification_event = payload.event.clone();
 
+    let control_notification = serde_json::json!({
+        "type": "git-event",
+        "repoPath": repo_path.to_string_lossy().to_string(),
+        "branch": if current_branch.is_empty() { serde_json::Value::Null } else { serde_json::json!(current_branch) },
+        "event": notification_event,
+        "followMode": follow_mode,
+        "sessionsUpdated": updated_session_ids,
+    });
+
+    let control_message = create_control_event(
+        "git",
+        "repository-changed",
+        Some(control_notification.clone()),
+        None,
+    );
+    send_control_message_to_mac(&state, control_message).await;
+
     Json(serde_json::json!({
         "success": true,
         "repoPath": repo_path.to_string_lossy().to_string(),
         "sessionsUpdated": updated_session_ids.len(),
         "followMode": follow_mode,
-        "notification": {
-            "type": "git-event",
-            "repoPath": repo_path.to_string_lossy().to_string(),
-            "branch": if current_branch.is_empty() { serde_json::Value::Null } else { serde_json::json!(current_branch) },
-            "event": notification_event,
-            "followMode": follow_mode,
-            "sessionsUpdated": updated_session_ids,
-        }
+        "notification": control_notification,
     }))
     .into_response()
 }
@@ -4889,16 +4979,28 @@ async fn api_follow_worktrees(
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("repository");
-        let mut notifications = state.git_notifications.lock().await;
-        notifications.push(GitNotificationEntry {
-            timestamp_ms: now_unix_ms(),
-            notification: GitUiNotification {
-                level: "info".to_string(),
-                title: "Follow Mode Enabled".to_string(),
-                message: format!("Now following branch '{}' in {}", branch, repo_name),
-            },
-        });
-        trim_old_git_notifications(&mut notifications);
+        let follow_enabled_message = format!("Now following branch '{}' in {}", branch, repo_name);
+
+        {
+            let mut notifications = state.git_notifications.lock().await;
+            notifications.push(GitNotificationEntry {
+                timestamp_ms: now_unix_ms(),
+                notification: GitUiNotification {
+                    level: "info".to_string(),
+                    title: "Follow Mode Enabled".to_string(),
+                    message: follow_enabled_message.clone(),
+                },
+            });
+            trim_old_git_notifications(&mut notifications);
+        }
+
+        send_control_notification_to_mac(
+            &state,
+            "info",
+            "Follow Mode Enabled",
+            &follow_enabled_message,
+        )
+        .await;
 
         return Json(serde_json::json!({
             "success": true,
@@ -4940,16 +5042,28 @@ async fn api_follow_worktrees(
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("repository");
-    let mut notifications = state.git_notifications.lock().await;
-    notifications.push(GitNotificationEntry {
-        timestamp_ms: now_unix_ms(),
-        notification: GitUiNotification {
-            level: "info".to_string(),
-            title: "Follow Mode Disabled".to_string(),
-            message: format!("Follow mode has been disabled for {}", repo_name),
-        },
-    });
-    trim_old_git_notifications(&mut notifications);
+    let follow_disabled_message = format!("Follow mode has been disabled for {}", repo_name);
+
+    {
+        let mut notifications = state.git_notifications.lock().await;
+        notifications.push(GitNotificationEntry {
+            timestamp_ms: now_unix_ms(),
+            notification: GitUiNotification {
+                level: "info".to_string(),
+                title: "Follow Mode Disabled".to_string(),
+                message: follow_disabled_message.clone(),
+            },
+        });
+        trim_old_git_notifications(&mut notifications);
+    }
+
+    send_control_notification_to_mac(
+        &state,
+        "info",
+        "Follow Mode Disabled",
+        &follow_disabled_message,
+    )
+    .await;
 
     match hooks_uninstall_result {
         Ok(()) => Json(serde_json::json!({
@@ -7399,6 +7513,19 @@ async fn finalize_session_exit(state: AppState, session_id: String, exit_code: i
     }))
     .unwrap_or_default();
     broadcast_to_session(&state, "", WsV3MessageType::Event, global_event_payload).await;
+
+    let should_notify_session_exit = {
+        let app_config = state.app_config.lock().await;
+        app_config
+            .notification_preferences
+            .as_ref()
+            .map(|preferences| preferences.session_exit)
+            .unwrap_or(false)
+    };
+
+    if should_notify_session_exit {
+        send_control_notification_to_mac(&state, "info", "Session Ended", &session_name).await;
+    }
 }
 
 async fn spawn_local_session_process(
@@ -7607,8 +7734,7 @@ async fn api_create_session(
             .into_response();
     }
 
-    let id = uuid_like();
-    let now = now_iso();
+    let spawn_terminal = payload.spawn_terminal.unwrap_or(false);
     let command = payload.command;
 
     let fallback_working_dir = std::env::current_dir()
@@ -7627,11 +7753,43 @@ async fn api_create_session(
         working_dir = fallback_working_dir.clone();
     }
 
-    let session_name = payload.name.unwrap_or_else(|| command.join(" "));
-    let command_text = command.join(" ");
-
     let requested_cols = payload.cols.unwrap_or(80).clamp(20, 1000);
     let requested_rows = payload.rows.unwrap_or(24).clamp(10, 1000);
+
+    if spawn_terminal {
+        let session_id = uuid_like();
+
+        let git_info = detect_git_info_for_directory(Path::new(&working_dir));
+        let request_payload = TerminalSpawnPayload {
+            session_id: Some(session_id.clone()),
+            working_directory: Some(working_dir.clone()),
+            command: Some(command.join(" ")),
+            terminal_preference: None,
+            git_repo_path: git_info.git_repo_path,
+            git_branch: git_info.git_branch,
+            git_ahead_count: git_info.git_ahead_count,
+            git_behind_count: git_info.git_behind_count,
+            git_has_changes: git_info.git_has_changes,
+            git_is_worktree: git_info.git_is_worktree,
+            git_main_repo_path: git_info.git_main_repo_path,
+        };
+
+        if let Ok(spawn_response) = request_terminal_spawn(&state, request_payload).await {
+            if spawn_response.success {
+                return Json(SessionCreateResponse {
+                    session_id,
+                    created_at: now_iso(),
+                    message: Some("Terminal spawn requested".to_string()),
+                })
+                .into_response();
+            }
+        }
+    }
+
+    let id = uuid_like();
+    let now = now_iso();
+    let session_name = payload.name.unwrap_or_else(|| command.join(" "));
+    let command_text = command.join(" ");
 
     state
         .session_dimensions
@@ -7694,6 +7852,19 @@ async fn api_create_session(
     }))
     .unwrap_or_default();
     broadcast_to_session(&state, "", WsV3MessageType::Event, event_payload).await;
+
+    let should_notify_session_start = {
+        let app_config = state.app_config.lock().await;
+        app_config
+            .notification_preferences
+            .as_ref()
+            .map(|preferences| preferences.session_start)
+            .unwrap_or(false)
+    };
+
+    if should_notify_session_start {
+        send_control_notification_to_mac(&state, "info", "Session Started", &session_name).await;
+    }
 
     Json(SessionCreateResponse {
         session_id: id,
@@ -7764,6 +7935,19 @@ async fn api_delete_session(
         }))
         .unwrap_or_default();
         broadcast_to_session(&state, "", WsV3MessageType::Event, event_payload).await;
+
+        let should_notify_session_exit = {
+            let app_config = state.app_config.lock().await;
+            app_config
+                .notification_preferences
+                .as_ref()
+                .map(|preferences| preferences.session_exit)
+                .unwrap_or(false)
+        };
+
+        if should_notify_session_exit {
+            send_control_notification_to_mac(&state, "info", "Session Ended", &removed.name).await;
+        }
 
         return Json(serde_json::json!({ "success": true, "message": "Session killed" }))
             .into_response();
@@ -9067,6 +9251,436 @@ fn uuid_like() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
+fn create_control_event(
+    category: &str,
+    action: &str,
+    payload: Option<serde_json::Value>,
+    session_id: Option<String>,
+) -> ControlMessage {
+    ControlMessage {
+        id: uuid_like(),
+        message_type: "event".to_string(),
+        category: category.to_string(),
+        action: action.to_string(),
+        payload,
+        session_id,
+        user_id: None,
+        error: None,
+    }
+}
+
+fn create_control_request(
+    category: &str,
+    action: &str,
+    payload: Option<serde_json::Value>,
+    session_id: Option<String>,
+) -> ControlMessage {
+    ControlMessage {
+        id: uuid_like(),
+        message_type: "request".to_string(),
+        category: category.to_string(),
+        action: action.to_string(),
+        payload,
+        session_id,
+        user_id: None,
+        error: None,
+    }
+}
+
+fn create_control_response(
+    request: &ControlMessage,
+    payload: Option<serde_json::Value>,
+    error: Option<String>,
+) -> ControlMessage {
+    ControlMessage {
+        id: request.id.clone(),
+        message_type: "response".to_string(),
+        category: request.category.clone(),
+        action: request.action.clone(),
+        payload,
+        session_id: request.session_id.clone(),
+        user_id: request.user_id.clone(),
+        error,
+    }
+}
+
+fn detect_git_info_for_directory(full_path: &Path) -> DetectGitInfoResponse {
+    let Some(status) = get_git_status_for_directory(full_path) else {
+        return DetectGitInfoResponse {
+            git_repo_path: None,
+            git_branch: None,
+            git_ahead_count: None,
+            git_behind_count: None,
+            git_has_changes: None,
+            git_is_worktree: None,
+            git_main_repo_path: None,
+        };
+    };
+
+    let repo_path = run_git(
+        full_path,
+        vec![
+            "rev-parse".to_string(),
+            "--show-toplevel".to_string(),
+        ],
+    )
+    .ok()
+    .map(|(stdout, _)| stdout.trim().to_string())
+    .filter(|value| !value.is_empty());
+
+    let branch = status
+        .get("branch")
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string())
+        .filter(|value| !value.is_empty());
+
+    let ahead = status
+        .get("ahead")
+        .and_then(|value| value.as_u64())
+        .map(|value| value as u32)
+        .unwrap_or(0);
+
+    let behind = status
+        .get("behind")
+        .and_then(|value| value.as_u64())
+        .map(|value| value as u32)
+        .unwrap_or(0);
+
+    let has_changes = status
+        .get("modified")
+        .and_then(|value| value.as_array())
+        .is_some_and(|items| !items.is_empty())
+        || status
+            .get("added")
+            .and_then(|value| value.as_array())
+            .is_some_and(|items| !items.is_empty())
+        || status
+            .get("deleted")
+            .and_then(|value| value.as_array())
+            .is_some_and(|items| !items.is_empty())
+        || status
+            .get("untracked")
+            .and_then(|value| value.as_array())
+            .is_some_and(|items| !items.is_empty());
+
+    let git_main_repo_path = repo_path.clone();
+
+    DetectGitInfoResponse {
+        git_repo_path: repo_path,
+        git_branch: branch,
+        git_ahead_count: Some(ahead),
+        git_behind_count: Some(behind),
+        git_has_changes: Some(has_changes),
+        git_is_worktree: Some(false),
+        git_main_repo_path,
+    }
+}
+
+async fn request_terminal_spawn(
+    state: &AppState,
+    payload: TerminalSpawnPayload,
+) -> Result<TerminalSpawnResponsePayload> {
+    let session_id = payload
+        .session_id
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow!("Missing sessionId"))?;
+
+    let request = create_control_request(
+        "terminal",
+        "spawn",
+        Some(serde_json::to_value(&payload)?),
+        Some(session_id),
+    );
+
+    let response = send_control_message_and_wait(state, request, Duration::from_secs(10)).await;
+
+    let response = response.ok_or_else(|| anyhow!("No response from Mac app"))?;
+
+    if let Some(error) = response.error {
+        return Ok(TerminalSpawnResponsePayload {
+            success: false,
+            pid: None,
+            error: Some(error),
+        });
+    }
+
+    let payload_value = response
+        .payload
+        .ok_or_else(|| anyhow!("Missing payload in Mac app response"))?;
+
+    let decoded: TerminalSpawnResponsePayload = serde_json::from_value(payload_value)
+        .map_err(|error| anyhow!("Invalid terminal spawn response: {error}"))?;
+
+    Ok(decoded)
+}
+
+fn control_socket_path() -> PathBuf {
+    control_directory().join("control.sock")
+}
+
+async fn is_mac_app_connected(state: &AppState) -> bool {
+    state.control_socket.mac_sender.lock().await.is_some()
+}
+
+async fn send_control_message_to_mac(state: &AppState, message: ControlMessage) {
+    let payload = match serde_json::to_vec(&message) {
+        Ok(payload) => payload,
+        Err(_) => return,
+    };
+
+    let framed = encode_control_message(&payload);
+
+    let sender = state.control_socket.mac_sender.lock().await.clone();
+    if let Some(sender) = sender {
+        let _ = sender.send(framed);
+    }
+}
+
+async fn send_control_message_and_wait(
+    state: &AppState,
+    message: ControlMessage,
+    timeout: Duration,
+) -> Option<ControlMessage> {
+    if !is_mac_app_connected(state).await {
+        return None;
+    }
+
+    let message_id = message.id.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel::<ControlMessage>();
+
+    {
+        let mut pending = state.control_socket.pending_requests.lock().await;
+        pending.insert(message_id.clone(), tx);
+    }
+
+    send_control_message_to_mac(state, message).await;
+
+    let response = tokio::time::timeout(timeout, rx).await;
+
+    {
+        let mut pending = state.control_socket.pending_requests.lock().await;
+        pending.remove(&message_id);
+    }
+
+    match response {
+        Ok(Ok(message)) => Some(message),
+        _ => None,
+    }
+}
+
+async fn send_control_notification_to_mac(
+    state: &AppState,
+    level: &str,
+    title: &str,
+    message: &str,
+) {
+    let notification_payload = serde_json::json!({
+        "level": level,
+        "title": title,
+        "message": message,
+    });
+
+    let event = create_control_event(
+        "system",
+        "notification",
+        Some(notification_payload),
+        None,
+    );
+    send_control_message_to_mac(state, event).await;
+}
+
+async fn handle_control_message(state: AppState, message: ControlMessage) {
+    if message.message_type == "response" {
+        let pending = {
+            let mut pending_requests = state.control_socket.pending_requests.lock().await;
+            pending_requests.remove(&message.id)
+        };
+
+        if let Some(resolver) = pending {
+            let _ = resolver.send(message);
+        }
+        return;
+    }
+
+    if message.category == "system" && message.action == "ping" {
+        let response = create_control_response(
+            &message,
+            Some(serde_json::json!({
+                "status": "ok",
+                "timestamp": now_unix_ms(),
+            })),
+            None,
+        );
+
+        send_control_message_to_mac(&state, response).await;
+        return;
+    }
+
+    if message.category == "terminal" && message.action == "spawn" && message.message_type == "request" {
+        let payload = message
+            .payload
+            .as_ref()
+            .and_then(|value| serde_json::from_value::<TerminalSpawnPayload>(value.clone()).ok());
+
+        let response = if let Some(payload) = payload {
+            let success = payload
+                .session_id
+                .as_ref()
+                .is_some_and(|id| !id.trim().is_empty())
+                && payload
+                    .working_directory
+                    .as_ref()
+                    .is_some_and(|dir| !dir.trim().is_empty())
+                && payload
+                    .command
+                    .as_ref()
+                    .is_some_and(|command| !command.trim().is_empty());
+
+            if success {
+                create_control_response(
+                    &message,
+                    Some(serde_json::to_value(TerminalSpawnResponsePayload {
+                        success: true,
+                        pid: None,
+                        error: None,
+                    })
+                    .unwrap_or_else(|_| serde_json::json!({ "success": true }))),
+                    None,
+                )
+            } else {
+                create_control_response(
+                    &message,
+                    Some(serde_json::to_value(TerminalSpawnResponsePayload {
+                        success: false,
+                        pid: None,
+                        error: Some("Invalid terminal spawn payload".to_string()),
+                    })
+                    .unwrap_or_else(|_| serde_json::json!({ "success": false }))),
+                    Some("Invalid terminal spawn payload".to_string()),
+                )
+            }
+        } else {
+            create_control_response(
+                &message,
+                Some(serde_json::to_value(TerminalSpawnResponsePayload {
+                    success: false,
+                    pid: None,
+                    error: Some("Invalid terminal spawn payload".to_string()),
+                })
+                .unwrap_or_else(|_| serde_json::json!({ "success": false }))),
+                Some("Invalid terminal spawn payload".to_string()),
+            )
+        };
+
+        send_control_message_to_mac(&state, response).await;
+    }
+}
+
+async fn handle_control_connection(state: AppState, stream: UnixStream) {
+    let (mut reader, mut writer) = stream.into_split();
+    let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+
+    {
+        let mut sender_lock = state.control_socket.mac_sender.lock().await;
+        *sender_lock = Some(tx.clone());
+    }
+
+    let ready_message = create_control_event("system", "ready", None, None);
+    if let Ok(payload) = serde_json::to_vec(&ready_message) {
+        let _ = tx.send(encode_control_message(&payload));
+    }
+
+    let writer_task = tokio::spawn(async move {
+        while let Some(frame) = rx.recv().await {
+            if writer.write_all(&frame).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut parser = ControlMessageParser::new();
+    let mut read_buffer = vec![0_u8; 8192];
+
+    loop {
+        let bytes_read = match reader.read(&mut read_buffer).await {
+            Ok(0) => break,
+            Ok(bytes_read) => bytes_read,
+            Err(_) => break,
+        };
+
+        parser.add_data(&read_buffer[..bytes_read]);
+        let messages = parser.parse_messages();
+
+        for payload in messages {
+            if let Ok(message) = serde_json::from_slice::<ControlMessage>(&payload) {
+                handle_control_message(state.clone(), message).await;
+            }
+        }
+    }
+
+    let _ = writer_task.await;
+
+    {
+        let mut sender_lock = state.control_socket.mac_sender.lock().await;
+        *sender_lock = None;
+    }
+
+    let mut pending = state.control_socket.pending_requests.lock().await;
+    pending.clear();
+}
+
+async fn start_control_socket_listener(state: AppState) -> Result<()> {
+    let socket_path = control_socket_path();
+
+    if let Some(parent) = socket_path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("Failed to create control socket directory {}", parent.display()))?;
+    }
+
+    if socket_path.exists() {
+        let _ = tokio::fs::remove_file(&socket_path).await;
+    }
+
+    let listener = UnixListener::bind(&socket_path)
+        .with_context(|| format!("Failed to bind control socket at {}", socket_path.display()))?;
+
+    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600)).with_context(|| {
+        format!(
+            "Failed to set permissions on control socket {}",
+            socket_path.display()
+        )
+    })?;
+
+    let state_for_task = state.clone();
+    let task = tokio::spawn(async move {
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(_) => break,
+            };
+
+            {
+                let mut sender_lock = state_for_task.control_socket.mac_sender.lock().await;
+                *sender_lock = None;
+            }
+
+            {
+                let mut pending = state_for_task.control_socket.pending_requests.lock().await;
+                pending.clear();
+            }
+
+            handle_control_connection(state_for_task.clone(), stream).await;
+        }
+    });
+
+    let mut listener_task = state.control_socket.listener_task.lock().await;
+    *listener_task = Some(task);
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9191,6 +9805,24 @@ mod tests {
         assert!(!backup_path.exists());
 
         let _ = std::fs::remove_dir_all(repo_root);
+    }
+
+    #[tokio::test]
+    async fn control_event_encoding_matches_length_prefixed_protocol() {
+        let message = create_control_event(
+            "system",
+            "notification",
+            Some(serde_json::json!({"title": "t", "message": "m"})),
+            None,
+        );
+
+        let json = serde_json::to_vec(&message).expect("serialize control message");
+        let framed = encode_control_message(&json);
+
+        assert_eq!(framed.len(), json.len() + 4);
+        let declared_len = u32::from_be_bytes([framed[0], framed[1], framed[2], framed[3]]) as usize;
+        assert_eq!(declared_len, json.len());
+        assert_eq!(&framed[4..], json.as_slice());
     }
 
 }
