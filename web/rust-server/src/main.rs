@@ -270,6 +270,8 @@ struct LocalSessionProcess {
     pid: u32,
     cols: u16,
     rows: u16,
+    current_command: Option<String>,
+    command_started_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -437,7 +439,7 @@ struct SessionCreateRequest {
     #[serde(rename = "spawn_terminal")]
     spawn_terminal: Option<bool>,
     #[serde(rename = "titleMode")]
-    title_mode: Option<String>,
+    _title_mode: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -4994,11 +4996,13 @@ async fn api_follow_worktrees(
             trim_old_git_notifications(&mut notifications);
         }
 
-        send_control_notification_to_mac(
+        maybe_send_notification_event_to_mac(
             &state,
-            "info",
+            "session-start",
             "Follow Mode Enabled",
             &follow_enabled_message,
+            None,
+            None,
         )
         .await;
 
@@ -5057,11 +5061,13 @@ async fn api_follow_worktrees(
         trim_old_git_notifications(&mut notifications);
     }
 
-    send_control_notification_to_mac(
+    maybe_send_notification_event_to_mac(
         &state,
-        "info",
+        "session-exit",
         "Follow Mode Disabled",
         &follow_disabled_message,
+        None,
+        None,
     )
     .await;
 
@@ -6554,16 +6560,20 @@ async fn api_multiplexer_attach(
 
         let _title_mode = payload.title_mode;
 
+        let attached_session_name = format!("kitty: id:{window_id}");
         let command_text = command.join(" ");
-        let event_payload = serde_json::to_vec(&serde_json::json!({
-            "type": "session-start",
-            "sessionId": session_id,
-            "sessionName": format!("kitty: id:{window_id}"),
-            "command": command_text,
-            "timestamp": now,
-        }))
-        .unwrap_or_default();
-        broadcast_to_session(&state, "", WsV3MessageType::Event, event_payload).await;
+        emit_server_event(
+            &state,
+            None,
+            serde_json::json!({
+                "type": "session-start",
+                "sessionId": session_id,
+                "sessionName": attached_session_name,
+                "command": command_text,
+                "timestamp": now,
+            }),
+        )
+        .await;
 
         return Json(serde_json::json!({
             "success": true,
@@ -6727,16 +6737,20 @@ async fn api_multiplexer_attach(
 
     let _title_mode = payload.title_mode;
 
+    let attached_session_name = format!("{mux_type}: {normalized_session_name}");
     let command_text = command.join(" ");
-    let event_payload = serde_json::to_vec(&serde_json::json!({
-        "type": "session-start",
-        "sessionId": session_id,
-        "sessionName": format!("{mux_type}: {normalized_session_name}"),
-        "command": command_text,
-        "timestamp": now,
-    }))
-    .unwrap_or_default();
-    broadcast_to_session(&state, "", WsV3MessageType::Event, event_payload).await;
+    emit_server_event(
+        &state,
+        None,
+        serde_json::json!({
+            "type": "session-start",
+            "sessionId": session_id,
+            "sessionName": attached_session_name,
+            "command": command_text,
+            "timestamp": now,
+        }),
+    )
+    .await;
 
     Json(serde_json::json!({
         "success": true,
@@ -7440,6 +7454,40 @@ async fn read_child_output_to_ws(
             chunk.to_vec(),
         )
         .await;
+
+        if chunk.contains(&0x07) {
+            let session_name = {
+                let sessions = state.sessions.lock().await;
+                sessions
+                    .iter()
+                    .find(|session| session.id == session_id)
+                    .map(|session| session.name.clone())
+            };
+
+            if let Some(session_name) = session_name {
+                emit_server_event(
+                    &state,
+                    None,
+                    serde_json::json!({
+                        "type": "bell",
+                        "sessionId": session_id,
+                        "sessionName": session_name,
+                        "timestamp": now_iso(),
+                    }),
+                )
+                .await;
+
+                maybe_send_notification_event_to_mac(
+                    &state,
+                    "bell",
+                    "Terminal Bell",
+                    &session_name,
+                    Some(&session_id),
+                    Some(&session_name),
+                )
+                .await;
+            }
+        }
     }
 }
 
@@ -7465,6 +7513,170 @@ fn signal_pid(pid: u32, signal: Option<&str>) {
 
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn now_unix_ms_i64() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn extract_command_from_input(data: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(data).ok()?.trim();
+    if text.is_empty() {
+        return None;
+    }
+
+    if text.contains('\u{1b}') || text.contains('\u{7f}') {
+        return None;
+    }
+
+    Some(text.to_string())
+}
+
+async fn emit_command_event_if_needed(
+    state: &AppState,
+    session_id: &str,
+    command: &str,
+    started_at_ms: Option<i64>,
+    exit_code: i32,
+) {
+    let duration = started_at_ms
+        .map(|start| (now_unix_ms_i64() - start).max(0))
+        .unwrap_or(0);
+
+    if duration < 1_000 {
+        return;
+    }
+
+    let session_name = {
+        let sessions = state.sessions.lock().await;
+        sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .map(|session| session.name.clone())
+    };
+
+    let Some(session_name) = session_name else {
+        return;
+    };
+
+    let event_type = if exit_code == 0 {
+        "command-finished"
+    } else {
+        "command-error"
+    };
+
+    emit_server_event(
+        state,
+        None,
+        serde_json::json!({
+            "type": event_type,
+            "sessionId": session_id,
+            "sessionName": session_name,
+            "command": command,
+            "exitCode": exit_code,
+            "duration": duration,
+            "timestamp": now_iso(),
+        }),
+    )
+    .await;
+
+    if exit_code == 0 {
+        maybe_send_notification_event_to_mac(
+            state,
+            "command-finished",
+            "Your Turn",
+            command,
+            Some(session_id),
+            None,
+        )
+        .await;
+    } else {
+        maybe_send_notification_event_to_mac(
+            state,
+            "command-error",
+            "Command Failed",
+            command,
+            Some(session_id),
+            None,
+        )
+        .await;
+    }
+}
+
+async fn is_notification_enabled(state: &AppState, key: &str) -> bool {
+    let app_config = state.app_config.lock().await;
+    let Some(preferences) = app_config.notification_preferences.as_ref() else {
+        return false;
+    };
+
+    if !preferences.enabled {
+        return false;
+    }
+
+    match key {
+        "session-start" => preferences.session_start,
+        "session-exit" => preferences.session_exit,
+        "command-finished" => preferences.command_completion,
+        "command-error" => preferences.command_error,
+        "bell" => preferences.bell,
+        _ => false,
+    }
+}
+
+async fn emit_server_event(
+    state: &AppState,
+    session_id: Option<&str>,
+    payload: serde_json::Value,
+) {
+    let frame_payload = serde_json::to_vec(&payload).unwrap_or_default();
+
+    match session_id {
+        Some(session_id) => {
+            broadcast_to_session(state, session_id, WsV3MessageType::Event, frame_payload.clone())
+                .await;
+            broadcast_to_session(state, "", WsV3MessageType::Event, frame_payload).await;
+        }
+        None => {
+            broadcast_to_session(state, "", WsV3MessageType::Event, frame_payload).await;
+        }
+    }
+}
+
+async fn maybe_send_notification_event_to_mac(
+    state: &AppState,
+    notification_type: &str,
+    title: &str,
+    body: &str,
+    session_id: Option<&str>,
+    session_name: Option<&str>,
+) {
+    if !is_notification_enabled(state, notification_type).await {
+        return;
+    }
+
+    let mut payload = serde_json::Map::new();
+    payload.insert("type".to_string(), serde_json::json!(notification_type));
+    payload.insert("title".to_string(), serde_json::json!(title));
+    payload.insert("body".to_string(), serde_json::json!(body));
+
+    if let Some(session_id) = session_id {
+        payload.insert("sessionId".to_string(), serde_json::json!(session_id));
+    }
+
+    if let Some(session_name) = session_name {
+        payload.insert("sessionName".to_string(), serde_json::json!(session_name));
+    }
+
+    let event = create_control_event(
+        "notification",
+        "show",
+        Some(serde_json::Value::Object(payload)),
+        session_id.map(|value| value.to_string()),
+    );
+    send_control_message_to_mac(state, event).await;
 }
 
 async fn finalize_session_exit(state: AppState, session_id: String, exit_code: i32) {
@@ -7514,17 +7726,25 @@ async fn finalize_session_exit(state: AppState, session_id: String, exit_code: i
     .unwrap_or_default();
     broadcast_to_session(&state, "", WsV3MessageType::Event, global_event_payload).await;
 
-    let should_notify_session_exit = {
-        let app_config = state.app_config.lock().await;
-        app_config
-            .notification_preferences
-            .as_ref()
-            .map(|preferences| preferences.session_exit)
-            .unwrap_or(false)
+    maybe_send_notification_event_to_mac(
+        &state,
+        "session-exit",
+        "Session Ended",
+        &session_name,
+        Some(&session_id),
+        Some(&session_name),
+    )
+    .await;
+
+    let process_command = {
+        let mut processes = state.local_processes.lock().await;
+        processes.remove(&session_id).and_then(|process| {
+            process.current_command.map(|command| (command, process.command_started_at_ms))
+        })
     };
 
-    if should_notify_session_exit {
-        send_control_notification_to_mac(&state, "info", "Session Ended", &session_name).await;
+    if let Some((command, started_at_ms)) = process_command {
+        emit_command_event_if_needed(&state, &session_id, &command, started_at_ms, exit_code).await;
     }
 }
 
@@ -7602,6 +7822,8 @@ async fn spawn_local_session_process(
                 pid,
                 cols: initial_cols,
                 rows: initial_rows,
+                current_command: None,
+                command_started_at_ms: None,
             },
         );
     }
@@ -7758,12 +7980,27 @@ async fn api_create_session(
 
     if spawn_terminal {
         let session_id = uuid_like();
+        let session_label = payload
+            .name
+            .as_ref()
+            .filter(|value| !value.trim().is_empty())
+            .cloned()
+            .unwrap_or_else(|| command.join(" "));
+        let command_text_for_spawn = command.join(" ");
+
+        let session_started_event = serde_json::json!({
+            "type": "session-start",
+            "sessionId": session_id.clone(),
+            "sessionName": session_label.clone(),
+            "command": command_text_for_spawn.clone(),
+            "timestamp": now_iso(),
+        });
 
         let git_info = detect_git_info_for_directory(Path::new(&working_dir));
         let request_payload = TerminalSpawnPayload {
             session_id: Some(session_id.clone()),
             working_directory: Some(working_dir.clone()),
-            command: Some(command.join(" ")),
+            command: Some(command_text_for_spawn.clone()),
             terminal_preference: None,
             git_repo_path: git_info.git_repo_path,
             git_branch: git_info.git_branch,
@@ -7776,6 +8013,18 @@ async fn api_create_session(
 
         if let Ok(spawn_response) = request_terminal_spawn(&state, request_payload).await {
             if spawn_response.success {
+                emit_server_event(&state, None, session_started_event).await;
+
+                maybe_send_notification_event_to_mac(
+                    &state,
+                    "session-start",
+                    "Session Started",
+                    &session_label,
+                    Some(&session_id),
+                    Some(&session_label),
+                )
+                .await;
+
                 return Json(SessionCreateResponse {
                     session_id,
                     created_at: now_iso(),
@@ -7843,28 +8092,28 @@ async fn api_create_session(
             .into_response();
     }
 
-    let event_payload = serde_json::to_vec(&serde_json::json!({
-        "type": "session-start",
-        "sessionId": id,
-        "sessionName": session_name,
-        "command": command_text,
-        "timestamp": now,
-    }))
-    .unwrap_or_default();
-    broadcast_to_session(&state, "", WsV3MessageType::Event, event_payload).await;
+    emit_server_event(
+        &state,
+        None,
+        serde_json::json!({
+            "type": "session-start",
+            "sessionId": id.clone(),
+            "sessionName": session_name.clone(),
+            "command": command_text.clone(),
+            "timestamp": now.clone(),
+        }),
+    )
+    .await;
 
-    let should_notify_session_start = {
-        let app_config = state.app_config.lock().await;
-        app_config
-            .notification_preferences
-            .as_ref()
-            .map(|preferences| preferences.session_start)
-            .unwrap_or(false)
-    };
-
-    if should_notify_session_start {
-        send_control_notification_to_mac(&state, "info", "Session Started", &session_name).await;
-    }
+    maybe_send_notification_event_to_mac(
+        &state,
+        "session-start",
+        "Session Started",
+        &session_name,
+        Some(&id),
+        Some(&session_name),
+    )
+    .await;
 
     Json(SessionCreateResponse {
         session_id: id,
@@ -7914,8 +8163,17 @@ async fn api_delete_session(
         drop(sessions);
 
         if let Some(mut proc) = state.local_processes.lock().await.remove(&session_id) {
+            let command_context = proc
+                .current_command
+                .take()
+                .map(|command| (command, proc.command_started_at_ms));
+
             let _ = proc.stdin.take();
             signal_pid(proc.pid, Some("KILL"));
+
+            if let Some((command, started_at_ms)) = command_context {
+                emit_command_event_if_needed(&state, &session_id, &command, started_at_ms, 0).await;
+            }
         }
 
         state.session_outputs.lock().await.remove(&session_id);
@@ -7925,29 +8183,31 @@ async fn api_delete_session(
             handle.abort();
         }
 
-        let event_payload = serde_json::to_vec(&serde_json::json!({
-            "type": "session-exit",
-            "sessionId": session_id,
-            "sessionName": removed.name,
-            "command": removed.command.join(" "),
-            "exitCode": 0,
-            "timestamp": now_iso(),
-        }))
-        .unwrap_or_default();
-        broadcast_to_session(&state, "", WsV3MessageType::Event, event_payload).await;
+        let command_text = removed.command.join(" ");
 
-        let should_notify_session_exit = {
-            let app_config = state.app_config.lock().await;
-            app_config
-                .notification_preferences
-                .as_ref()
-                .map(|preferences| preferences.session_exit)
-                .unwrap_or(false)
-        };
+        emit_server_event(
+            &state,
+            None,
+            serde_json::json!({
+                "type": "session-exit",
+                "sessionId": session_id,
+                "sessionName": removed.name,
+                "command": command_text,
+                "exitCode": 0,
+                "timestamp": now_iso(),
+            }),
+        )
+        .await;
 
-        if should_notify_session_exit {
-            send_control_notification_to_mac(&state, "info", "Session Ended", &removed.name).await;
-        }
+        maybe_send_notification_event_to_mac(
+            &state,
+            "session-exit",
+            "Session Ended",
+            &removed.name,
+            Some(&session_id),
+            Some(&removed.name),
+        )
+        .await;
 
         return Json(serde_json::json!({ "success": true, "message": "Session killed" }))
             .into_response();
@@ -7995,7 +8255,9 @@ async fn api_session_input(
             .into_response();
     }
 
+    let mut text_input_used = false;
     let emitted: Vec<u8> = if let Some(text) = payload.text {
+        text_input_used = true;
         text.into_bytes()
     } else if let Some(key) = payload.key {
         decode_input_key(key.as_bytes())
@@ -8009,10 +8271,21 @@ async fn api_session_input(
         return Json(serde_json::json!({ "success": true })).into_response();
     }
 
+    let command_from_input = if text_input_used {
+        extract_command_from_input(&emitted)
+    } else {
+        None
+    };
+
     let mut stdin_written = false;
     {
         let mut processes = state.local_processes.lock().await;
         if let Some(process) = processes.get_mut(&session_id) {
+            if let Some(command) = command_from_input {
+                process.current_command = Some(command);
+                process.command_started_at_ms = Some(now_unix_ms_i64());
+            }
+
             if let Some(stdin) = process.stdin.as_mut() {
                 if stdin.write_all(&emitted).await.is_ok() && stdin.flush().await.is_ok() {
                     stdin_written = true;
@@ -8122,8 +8395,17 @@ async fn api_cleanup_session(
         drop(sessions);
 
         if let Some(mut proc) = state.local_processes.lock().await.remove(&session_id) {
+            let command_context = proc
+                .current_command
+                .take()
+                .map(|command| (command, proc.command_started_at_ms));
+
             let _ = proc.stdin.take();
             signal_pid(proc.pid, Some("KILL"));
+
+            if let Some((command, started_at_ms)) = command_context {
+                emit_command_event_if_needed(&state, &session_id, &command, started_at_ms, 0).await;
+            }
         }
 
         state.session_outputs.lock().await.remove(&session_id);
@@ -8133,16 +8415,31 @@ async fn api_cleanup_session(
             handle.abort();
         }
 
-        let event_payload = serde_json::to_vec(&serde_json::json!({
-            "type": "session-exit",
-            "sessionId": session_id,
-            "sessionName": removed.name,
-            "command": removed.command.join(" "),
-            "exitCode": 0,
-            "timestamp": now_iso(),
-        }))
-        .unwrap_or_default();
-        broadcast_to_session(&state, "", WsV3MessageType::Event, event_payload).await;
+        let command_text = removed.command.join(" ");
+
+        emit_server_event(
+            &state,
+            None,
+            serde_json::json!({
+                "type": "session-exit",
+                "sessionId": session_id,
+                "sessionName": removed.name,
+                "command": command_text,
+                "exitCode": 0,
+                "timestamp": now_iso(),
+            }),
+        )
+        .await;
+
+        maybe_send_notification_event_to_mac(
+            &state,
+            "session-exit",
+            "Session Ended",
+            &removed.name,
+            Some(&session_id),
+            Some(&removed.name),
+        )
+        .await;
 
         return Json(serde_json::json!({ "success": true, "message": "Session cleaned up" }))
             .into_response();
@@ -8187,23 +8484,46 @@ async fn api_cleanup_exited(State(state): State<AppState>) -> impl IntoResponse 
             subscriptions.remove(&session_id);
             dimensions.remove(&session_id);
             if let Some(mut proc) = state.local_processes.lock().await.remove(&session_id) {
+                let command_context = proc
+                    .current_command
+                    .take()
+                    .map(|active_command| (active_command, proc.command_started_at_ms));
+
                 let _ = proc.stdin.take();
                 signal_pid(proc.pid, Some("KILL"));
+
+                if let Some((active_command, started_at_ms)) = command_context {
+                    emit_command_event_if_needed(&state, &session_id, &active_command, started_at_ms, 0)
+                        .await;
+                }
             }
             if let Some(handle) = state.git_watchers.lock().await.remove(&session_id) {
                 handle.abort();
             }
 
-            let event_payload = serde_json::to_vec(&serde_json::json!({
-                "type": "session-exit",
-                "sessionId": session_id,
-                "sessionName": session_name,
-                "command": command,
-                "exitCode": 0,
-                "timestamp": now_iso(),
-            }))
-            .unwrap_or_default();
-            broadcast_to_session(&state, "", WsV3MessageType::Event, event_payload).await;
+            emit_server_event(
+                &state,
+                None,
+                serde_json::json!({
+                    "type": "session-exit",
+                    "sessionId": session_id,
+                    "sessionName": session_name,
+                    "command": command,
+                    "exitCode": 0,
+                    "timestamp": now_iso(),
+                }),
+            )
+            .await;
+
+            maybe_send_notification_event_to_mac(
+                &state,
+                "session-exit",
+                "Session Ended",
+                &session_name,
+                Some(&session_id),
+                Some(&session_name),
+            )
+            .await;
         }
     }
 
@@ -8786,10 +9106,21 @@ async fn handle_ws(
                             continue;
                         }
 
+                        let command_from_input = if frame.ty == WsV3MessageType::InputText {
+                            extract_command_from_input(&emitted)
+                        } else {
+                            None
+                        };
+
                         let mut stdin_written = false;
                         {
                             let mut processes = state.local_processes.lock().await;
                             if let Some(process) = processes.get_mut(&session_id) {
+                                if let Some(command) = command_from_input {
+                                    process.current_command = Some(command);
+                                    process.command_started_at_ms = Some(now_unix_ms_i64());
+                                }
+
                                 if let Some(stdin) = process.stdin.as_mut() {
                                     if stdin.write_all(&emitted).await.is_ok()
                                         && stdin.flush().await.is_ok()
@@ -9469,26 +9800,6 @@ async fn send_control_message_and_wait(
     }
 }
 
-async fn send_control_notification_to_mac(
-    state: &AppState,
-    level: &str,
-    title: &str,
-    message: &str,
-) {
-    let notification_payload = serde_json::json!({
-        "level": level,
-        "title": title,
-        "message": message,
-    });
-
-    let event = create_control_event(
-        "system",
-        "notification",
-        Some(notification_payload),
-        None,
-    );
-    send_control_message_to_mac(state, event).await;
-}
 
 async fn handle_control_message(state: AppState, message: ControlMessage) {
     if message.message_type == "response" {
@@ -9810,9 +10121,9 @@ mod tests {
     #[tokio::test]
     async fn control_event_encoding_matches_length_prefixed_protocol() {
         let message = create_control_event(
-            "system",
             "notification",
-            Some(serde_json::json!({"title": "t", "message": "m"})),
+            "show",
+            Some(serde_json::json!({"title": "t", "body": "m", "type": "session-start"})),
             None,
         );
 

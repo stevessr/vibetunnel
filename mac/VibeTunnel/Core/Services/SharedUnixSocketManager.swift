@@ -238,4 +238,42 @@ final class SharedUnixSocketManager {
 
         self.logger.info("✅ System control handler initialized")
     }
+
+    /// Initialize notification control handler
+    func initializeNotificationHandler() {
+        self.registerControlHandler(for: .notification) { [weak self] data in
+            guard let self else { return nil }
+
+            guard let json = JSONValue.decodeObject(from: data),
+                  let action = json["action"]?.string
+            else {
+                self.logger.error("Invalid notification message format")
+                return self.createErrorResponse(
+                    for: data,
+                    category: ControlProtocol.Category.notification.rawValue,
+                    error: "Invalid message format")
+            }
+
+            guard action == "show" else {
+                self.logger.error("Unknown notification action: \(action)")
+                return self.createErrorResponse(
+                    for: data,
+                    category: ControlProtocol.Category.notification.rawValue,
+                    error: "Unknown notification action: \(action)")
+            }
+
+            guard let payload = json["payload"]?.object else {
+                self.logger.error("Notification payload missing or invalid")
+                return self.createErrorResponse(
+                    for: data,
+                    category: ControlProtocol.Category.notification.rawValue,
+                    error: "Missing notification payload")
+            }
+
+            await NotificationService.shared.handleControlNotification(payload: payload)
+            return nil
+        }
+
+        self.logger.info("✅ Notification control handler initialized")
+    }
 }

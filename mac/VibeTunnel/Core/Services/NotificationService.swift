@@ -262,6 +262,72 @@ final class NotificationService: NSObject, @preconcurrency UNUserNotificationCen
 
     // MARK: - Public Notification Methods
 
+    /// Handle control-socket notification event payload from server.
+    /// Expected payload shape:
+    /// {
+    ///   "type": "session-start" | "session-exit" | "command-finished" | "command-error" | "bell" | "test-notification",
+    ///   "title": "...",
+    ///   "body": "...",
+    ///   "sessionId": "..."?,
+    ///   "sessionName": "...",
+    ///   "command": "..."?,
+    ///   "exitCode": number?,
+    ///   "duration": number?,
+    ///   "message": "..."?
+    /// }
+    func handleControlNotification(payload: [String: JSONValue]) async {
+        guard self.configProvider?.notificationsEnabled ?? false else { return }
+
+        guard let typeString = payload["type"]?.string,
+              let eventType = ServerEventType(rawValue: typeString)
+        else {
+            self.logger.warning("Ignoring control notification with invalid or missing type")
+            return
+        }
+
+        // Respect per-type preferences (test notification bypasses per-type toggles)
+        switch eventType {
+        case .sessionStart:
+            guard self.preferences.sessionStart else { return }
+        case .sessionExit:
+            guard self.preferences.sessionExit else { return }
+        case .commandFinished:
+            guard self.preferences.commandCompletion else { return }
+        case .commandError:
+            guard self.preferences.commandError else { return }
+        case .bell:
+            guard self.preferences.bell else { return }
+        case .connected:
+            return
+        case .testNotification:
+            break
+        }
+
+        let sessionId = payload["sessionId"]?.string
+        let sessionName = payload["sessionName"]?.string
+        let command = payload["command"]?.string
+        let exitCode = payload["exitCode"]?.int
+        let duration = payload["duration"]?.int
+        let message = payload["message"]?.string
+        let title = payload["title"]?.string
+        let body = payload["body"]?.string
+
+        let event = ServerEvent(
+            type: eventType,
+            sessionId: sessionId,
+            sessionName: sessionName,
+            command: command,
+            exitCode: exitCode,
+            duration: duration,
+            processInfo: nil,
+            message: message,
+            title: title,
+            body: body,
+            timestamp: Date())
+
+        await self.sendNotification(for: event)
+    }
+
     /// Send a notification for a server event
     /// - Parameter event: The server event to create a notification for
     func sendNotification(for event: ServerEvent) async {

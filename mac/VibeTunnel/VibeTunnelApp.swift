@@ -252,6 +252,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // Could add any system-ready handling here if needed
         }
 
+        // Initialize notification control handler
+        SharedUnixSocketManager.shared.initializeNotificationHandler()
+
         // Start the shared unix socket manager after all handlers are registered
         SharedUnixSocketManager.shared.connect()
 
