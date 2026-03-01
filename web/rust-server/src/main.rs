@@ -3406,6 +3406,7 @@ fn unauthorized_response() -> Response {
 async fn api_health(State(state): State<AppState>) -> impl IntoResponse {
     let tailscale_enabled = state.config.enable_tailscale_serve;
     let tailscale_url = None::<String>;
+    let tailscale_running = tailscale_is_running(&state.config);
     let mode = if state.config.is_hq_mode {
         "hq"
     } else if has_hq_registration_config(&state.config) {
@@ -3428,9 +3429,9 @@ async fn api_health(State(state): State<AppState>) -> impl IntoResponse {
         is_public: false,
         tailscale: if tailscale_enabled {
             Some(HealthTailscale {
-                available: tailscale_is_running(&state.config),
-                is_running: tailscale_is_running(&state.config),
-                https_available: tailscale_is_running(&state.config),
+                available: tailscale_running,
+                is_running: tailscale_running,
+                https_available: tailscale_running,
                 is_public: tailscale_is_public(&state.config),
                 funnel: false,
                 mode: tailscale_mode(&state.config),
@@ -3471,8 +3472,9 @@ async fn api_server_status(State(state): State<AppState>) -> impl IntoResponse {
 
 async fn api_tailscale_status(State(state): State<AppState>) -> impl IntoResponse {
     let server_url = state.tailscale_server_url.lock().await.clone();
+    let tailscale_running = tailscale_is_running(&state.config);
     Json(SessionTailscaleStatusResponse {
-        is_running: tailscale_is_running(&state.config),
+        is_running: tailscale_running,
         is_permanently_disabled: !state.config.enable_tailscale_serve,
         last_error: tailscale_last_error(&state.config),
         recommendation: if state.config.enable_tailscale_serve {
@@ -3487,18 +3489,19 @@ async fn api_tailscale_status(State(state): State<AppState>) -> impl IntoRespons
 }
 
 async fn api_tailscale_test(State(state): State<AppState>) -> impl IntoResponse {
+    let tailscale_running = tailscale_is_running(&state.config);
     let test_response = SessionTailscaleTestResponse {
         timestamp: now_iso(),
         tailscale: serde_json::json!({
-            "installed": tailscale_is_running(&state.config),
-            "status": if tailscale_is_running(&state.config) {
+            "installed": tailscale_running,
+            "status": if tailscale_running {
                 "configured"
             } else {
                 "disabled"
             },
         }),
         tailscale_serve: serde_json::json!({
-            "configured": tailscale_is_running(&state.config),
+            "configured": tailscale_running,
             "error": tailscale_last_error(&state.config),
         }),
         server: serde_json::json!({
@@ -6835,6 +6838,20 @@ async fn api_multiplexer_attach(
                 sessions.remove(position);
             }
 
+            remove_session_info(&session_id);
+            emit_server_event(
+                &state,
+                None,
+                serde_json::json!({
+                    "type": "session-exit",
+                    "sessionId": session_id,
+                    "sessionName": format!("kitty: id:{window_id}"),
+                    "command": command.join(" "),
+                    "exitCode": 1,
+                    "timestamp": now_iso(),
+                }),
+            )
+            .await;
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({
@@ -7018,6 +7035,7 @@ async fn api_multiplexer_attach(
             sessions.remove(position);
         }
 
+        remove_session_info(&session_id);
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
@@ -8733,35 +8751,22 @@ async fn api_delete_session(
     State(state): State<AppState>,
     AxumPath(session_id): AxumPath<String>,
 ) -> impl IntoResponse {
-    let mut sessions = state.sessions.lock().await;
-    if let Some(position) = sessions.iter().position(|s| s.id == session_id) {
-        let removed = sessions.remove(position);
-        drop(sessions);
+    let session = {
+        let sessions = state.sessions.lock().await;
+        sessions.iter().find(|s| s.id == session_id).cloned()
+    };
 
-        if let Some(mut proc) = state.local_processes.lock().await.remove(&session_id) {
-            let command_context = proc
-                .current_command
-                .take()
-                .map(|command| (command, proc.command_started_at_ms));
+    let Some(session) = session else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "Session not found".to_string(),
+            }),
+        )
+            .into_response();
+    };
 
-            let _ = proc.writer.take();
-            if let Some(killer) = proc.killer.as_ref() {
-                let killer_clone = killer.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    if let Ok(mut guard) = killer_clone.inner.lock() {
-                        let _ = guard.kill();
-                    }
-                })
-                .await;
-            } else {
-                signal_pid(proc.pid, Some("KILL"));
-            }
-
-            if let Some((command, started_at_ms)) = command_context {
-                emit_command_event_if_needed(&state, &session_id, &command, started_at_ms, 0).await;
-            }
-        }
-
+    if session.status == "exited" {
         state.session_outputs.lock().await.remove(&session_id);
         state.session_subscriptions.lock().await.remove(&session_id);
         state.session_dimensions.lock().await.remove(&session_id);
@@ -8769,7 +8774,71 @@ async fn api_delete_session(
             handle.abort();
         }
 
-        let command_text = removed.command.join(" ");
+        {
+            let mut processes = state.local_processes.lock().await;
+            processes.remove(&session_id);
+        }
+
+        {
+            let mut sessions = state.sessions.lock().await;
+            sessions.retain(|s| s.id != session_id);
+        }
+
+        remove_session_info(&session_id);
+
+        return Json(serde_json::json!({ "success": true, "message": "Session cleaned up" }))
+            .into_response();
+    }
+
+    let is_tmux_attachment = session.name.starts_with("tmux:") || session.command.join(" ").contains("tmux attach");
+
+    let mut command_context: Option<(String, Option<i64>)> = None;
+    if let Some(mut proc) = state.local_processes.lock().await.remove(&session_id) {
+        command_context = proc
+            .current_command
+            .take()
+            .map(|command| (command, proc.command_started_at_ms));
+
+        let _ = proc.writer.take();
+        if let Some(killer) = proc.killer.as_ref() {
+            let killer_clone = killer.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                if let Ok(mut guard) = killer_clone.inner.lock() {
+                    let _ = guard.kill();
+                }
+            })
+            .await;
+        } else {
+            signal_pid(proc.pid, Some("TERM"));
+        }
+    }
+
+    let mut removed = false;
+    let mut waited_ms = 0u64;
+    while waited_ms < 3000 {
+        {
+            let mut sessions = state.sessions.lock().await;
+            if let Some(position) = sessions.iter().position(|s| s.id == session_id && s.status == "exited") {
+                sessions.remove(position);
+                removed = true;
+            }
+        }
+
+        if removed {
+            break;
+        }
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        waited_ms += 500;
+    }
+
+    if !removed {
+        let mut sessions = state.sessions.lock().await;
+        if let Some(position) = sessions.iter().position(|s| s.id == session_id) {
+            sessions.remove(position);
+        }
+
+        let command_text = session.command.join(" ");
 
         emit_server_event(
             &state,
@@ -8777,7 +8846,7 @@ async fn api_delete_session(
             serde_json::json!({
                 "type": "session-exit",
                 "sessionId": session_id,
-                "sessionName": removed.name,
+                "sessionName": session.name,
                 "command": command_text,
                 "exitCode": 0,
                 "timestamp": now_iso(),
@@ -8789,23 +8858,33 @@ async fn api_delete_session(
             &state,
             "session-exit",
             "Session Ended",
-            &removed.name,
+            &session.name,
             Some(&session_id),
-            Some(&removed.name),
+            Some(&session.name),
         )
         .await;
 
-        return Json(serde_json::json!({ "success": true, "message": "Session killed" }))
-            .into_response();
+        if let Some((command, started_at_ms)) = command_context {
+            emit_command_event_if_needed(&state, &session_id, &command, started_at_ms, 0).await;
+        }
     }
 
-    (
-        StatusCode::NOT_FOUND,
-        Json(ErrorResponse {
-            error: "Session not found".to_string(),
-        }),
-    )
-        .into_response()
+    state.session_outputs.lock().await.remove(&session_id);
+    state.session_subscriptions.lock().await.remove(&session_id);
+    state.session_dimensions.lock().await.remove(&session_id);
+    if let Some(handle) = state.git_watchers.lock().await.remove(&session_id) {
+        handle.abort();
+    }
+
+    remove_session_info(&session_id);
+
+    let message = if is_tmux_attachment {
+        "Detached from tmux session"
+    } else {
+        "Session killed"
+    };
+
+    Json(serde_json::json!({ "success": true, "message": message })).into_response()
 }
 
 async fn api_session_input(
@@ -8839,6 +8918,30 @@ async fn api_session_input(
             }),
         )
             .into_response();
+    }
+
+    if let Some(text) = payload.text.as_ref() {
+        if text.is_empty() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "Text must be a string".to_string(),
+                }),
+            )
+                .into_response();
+        }
+    }
+
+    if let Some(key) = payload.key.as_ref() {
+        if key.is_empty() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "Key must be a string".to_string(),
+                }),
+            )
+                .into_response();
+        }
     }
 
     let mut text_input_used = false;
@@ -8889,7 +8992,7 @@ async fn api_session_input(
 
     if !stdin_written {
         return (
-            StatusCode::NOT_FOUND,
+            StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
                 error: "Session is not running".to_string(),
             }),
@@ -8905,17 +9008,26 @@ async fn api_session_resize(
     AxumPath(session_id): AxumPath<String>,
     Json(payload): Json<SessionResizeRequest>,
 ) -> impl IntoResponse {
-    let sessions = state.sessions.lock().await;
-    let exists = sessions
-        .iter()
-        .any(|s| s.id == session_id && s.status == "running");
-    drop(sessions);
+    let session = {
+        let sessions = state.sessions.lock().await;
+        sessions.iter().find(|s| s.id == session_id).cloned()
+    };
 
-    if !exists {
+    let Some(session) = session else {
         return (
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
                 error: "Session not found".to_string(),
+            }),
+        )
+            .into_response();
+    };
+
+    if session.status != "running" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "Session is not running".to_string(),
             }),
         )
             .into_response();
@@ -8999,79 +9111,45 @@ async fn api_cleanup_session(
     State(state): State<AppState>,
     AxumPath(session_id): AxumPath<String>,
 ) -> impl IntoResponse {
-    let mut sessions = state.sessions.lock().await;
-    if let Some(position) = sessions.iter().position(|s| s.id == session_id) {
-        let removed = sessions.remove(position);
-        drop(sessions);
-
-        if let Some(mut proc) = state.local_processes.lock().await.remove(&session_id) {
-            let command_context = proc
-                .current_command
-                .take()
-                .map(|command| (command, proc.command_started_at_ms));
-
-            let _ = proc.writer.take();
-            if let Some(killer) = proc.killer.as_ref() {
-                let killer_clone = killer.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    if let Ok(mut guard) = killer_clone.inner.lock() {
-                        let _ = guard.kill();
-                    }
-                })
-                .await;
-            } else {
-                signal_pid(proc.pid, Some("KILL"));
-            }
-
-            if let Some((command, started_at_ms)) = command_context {
-                emit_command_event_if_needed(&state, &session_id, &command, started_at_ms, 0).await;
-            }
-        }
-
-        state.session_outputs.lock().await.remove(&session_id);
-        state.session_subscriptions.lock().await.remove(&session_id);
-        state.session_dimensions.lock().await.remove(&session_id);
-        if let Some(handle) = state.git_watchers.lock().await.remove(&session_id) {
-            handle.abort();
-        }
-
-        let command_text = removed.command.join(" ");
-
-        emit_server_event(
-            &state,
-            None,
-            serde_json::json!({
-                "type": "session-exit",
-                "sessionId": session_id,
-                "sessionName": removed.name,
-                "command": command_text,
-                "exitCode": 0,
-                "timestamp": now_iso(),
-            }),
-        )
-        .await;
-
-        maybe_send_notification_event_to_mac(
-            &state,
-            "session-exit",
-            "Session Ended",
-            &removed.name,
-            Some(&session_id),
-            Some(&removed.name),
-        )
-        .await;
-
-        return Json(serde_json::json!({ "success": true, "message": "Session cleaned up" }))
-            .into_response();
+    state.session_outputs.lock().await.remove(&session_id);
+    state.session_subscriptions.lock().await.remove(&session_id);
+    state.session_dimensions.lock().await.remove(&session_id);
+    if let Some(handle) = state.git_watchers.lock().await.remove(&session_id) {
+        handle.abort();
     }
 
-    (
-        StatusCode::NOT_FOUND,
-        Json(ErrorResponse {
-            error: "Session not found".to_string(),
-        }),
-    )
-        .into_response()
+    if let Some(mut proc) = state.local_processes.lock().await.remove(&session_id) {
+        let command_context = proc
+            .current_command
+            .take()
+            .map(|command| (command, proc.command_started_at_ms));
+
+        let _ = proc.writer.take();
+        if let Some(killer) = proc.killer.as_ref() {
+            let killer_clone = killer.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                if let Ok(mut guard) = killer_clone.inner.lock() {
+                    let _ = guard.kill();
+                }
+            })
+            .await;
+        } else {
+            signal_pid(proc.pid, Some("KILL"));
+        }
+
+        if let Some((command, started_at_ms)) = command_context {
+            emit_command_event_if_needed(&state, &session_id, &command, started_at_ms, 0).await;
+        }
+    }
+
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.retain(|s| s.id != session_id);
+    }
+
+    remove_session_info(&session_id);
+
+    Json(serde_json::json!({ "success": true, "message": "Session cleaned up" })).into_response()
 }
 
 async fn api_cleanup_exited(State(state): State<AppState>) -> impl IntoResponse {
@@ -9095,6 +9173,10 @@ async fn api_cleanup_exited(State(state): State<AppState>) -> impl IntoResponse 
     drop(sessions);
 
     if !exited_ids.is_empty() {
+        for session_id in &exited_ids {
+            remove_session_info(session_id);
+        }
+
         let mut outputs = state.session_outputs.lock().await;
         let mut subscriptions = state.session_subscriptions.lock().await;
         let mut dimensions = state.session_dimensions.lock().await;
@@ -9217,37 +9299,74 @@ async fn api_patch_session(
             .into_response();
     }
 
-    let mut sessions = state.sessions.lock().await;
-    if let Some(session) = sessions.iter_mut().find(|s| s.id == session_id) {
-        session.name = name.clone();
-        session.last_modified = now_iso();
-        return Json(serde_json::json!({ "success": true, "name": name })).into_response();
-    }
+    let unique_name = {
+        let mut sessions = state.sessions.lock().await;
+        let Some(position) = sessions.iter().position(|s| s.id == session_id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: "Session not found".to_string(),
+                }),
+            )
+                .into_response();
+        };
 
-    (
-        StatusCode::NOT_FOUND,
-        Json(ErrorResponse {
-            error: "Session not found".to_string(),
-        }),
-    )
-        .into_response()
+        let mut candidate = name.clone();
+        if sessions
+            .iter()
+            .enumerate()
+            .any(|(index, s)| index != position && s.name == candidate)
+        {
+            let base = candidate.clone();
+            let mut suffix = 2;
+            loop {
+                let next = format!("{} ({})", base, suffix);
+                if !sessions
+                    .iter()
+                    .enumerate()
+                    .any(|(index, s)| index != position && s.name == next)
+                {
+                    candidate = next;
+                    break;
+                }
+                suffix += 1;
+            }
+        }
+
+        sessions[position].name = candidate.clone();
+        sessions[position].last_modified = now_iso();
+        candidate
+    };
+
+    persist_session_by_id(&state, &session_id).await;
+
+    Json(serde_json::json!({ "success": true, "name": unique_name })).into_response()
 }
 
 async fn api_reset_session_size(
     State(state): State<AppState>,
     AxumPath(session_id): AxumPath<String>,
 ) -> impl IntoResponse {
-    let sessions = state.sessions.lock().await;
-    let exists = sessions
-        .iter()
-        .any(|s| s.id == session_id && s.status == "running");
-    drop(sessions);
+    let session = {
+        let sessions = state.sessions.lock().await;
+        sessions.iter().find(|s| s.id == session_id).cloned()
+    };
 
-    if !exists {
+    let Some(session) = session else {
         return (
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
                 error: "Session not found".to_string(),
+            }),
+        )
+            .into_response();
+    };
+
+    if session.status != "running" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "Session is not running".to_string(),
             }),
         )
             .into_response();
@@ -9265,6 +9384,32 @@ async fn api_reset_session_size(
     persist_session_by_id(&state, &session_id).await;
 
     state.session_dimensions.lock().await.remove(&session_id);
+
+    let mut reset_pid: Option<u32> = None;
+    let mut reset_master: Option<PtyMasterHandle> = None;
+    {
+        let processes = state.local_processes.lock().await;
+        if let Some(process) = processes.get(&session_id) {
+            reset_pid = Some(process.pid);
+            reset_master = process.master.clone();
+        }
+    }
+
+    if let Some(master) = reset_master {
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Ok(guard) = master.inner.lock() {
+                let _ = guard.resize(PtySize {
+                    rows: 24,
+                    cols: 80,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                });
+            }
+        })
+        .await;
+    } else if let Some(pid) = reset_pid {
+        signal_pid(pid, Some("WINCH"));
+    }
 
     Json(serde_json::json!({ "success": true })).into_response()
 }
@@ -10428,9 +10573,13 @@ fn encode_snapshot_from_output(output: &[u8], cols: u32, rows: u32) -> Vec<u8> {
             for fill_col in (x + 1)..(x + width).min(safe_cols) {
                 cells[y][fill_col].ch = " ".to_string();
                 cells[y][fill_col].width = 0;
-                cells[y][fill_col].fg = None;
-                cells[y][fill_col].bg = None;
-                cells[y][fill_col].attributes = None;
+                cells[y][fill_col].fg = current_fg;
+                cells[y][fill_col].bg = current_bg;
+                cells[y][fill_col].attributes = if current_attrs == 0 {
+                    None
+                } else {
+                    Some(current_attrs)
+                };
             }
         }
 
