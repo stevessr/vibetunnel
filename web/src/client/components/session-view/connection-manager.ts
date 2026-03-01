@@ -109,16 +109,13 @@ export class ConnectionManager {
       onEvent: (event) => {
         if (!this.session) return;
 
-        // v3 server events: { kind: 'exit', ... } or { type: 'git-status-update', ... }
         if (typeof event === 'object' && event !== null) {
           const e = event as {
-            kind?: string;
-            exitCode?: number;
             type?: string;
             sessionId?: string;
           } & Record<string, unknown>;
 
-          if (e.kind === 'exit') {
+          if (e.type === 'session-exit' && e.sessionId === this.session.id) {
             flush();
             this.onSessionExit(this.session.id);
             return;

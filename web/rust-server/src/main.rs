@@ -1,14 +1,17 @@
 use std::{
     collections::HashMap,
     fs,
-    io::Read,
+    io::{Read, Write},
     net::SocketAddr,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Command as ProcessCommand, Stdio},
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
     time::{Duration, Instant},
 };
+use base64::Engine;
+use rand::RngCore;
+use sha2::{Digest, Sha256};
 use anyhow::{anyhow, Context, Result};
 use futures::{SinkExt, StreamExt};
 use axum::{
@@ -29,9 +32,9 @@ use clap::{Parser, Subcommand};
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncWriteExt},
     net::{UnixListener, UnixStream},
-    process::{ChildStdin, Command as TokioCommand},
+    process::Command as TokioCommand,
     sync::{mpsc, Mutex},
     task::JoinHandle,
     time::{interval, interval_at, Instant as TokioInstant},
@@ -45,6 +48,7 @@ use vibetunnel_rs::protocol::{
         WsV3SubscribeFlags, WS_V3_VERSION,
     },
 };
+use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtyPair, PtySize};
 
 #[derive(Debug, Parser)]
 #[command(name = "vibetunnel")]
@@ -262,16 +266,91 @@ struct SessionEntry {
     git_ahead_count: Option<u32>,
     #[serde(rename = "gitBehindCount", skip_serializing_if = "Option::is_none")]
     git_behind_count: Option<u32>,
+    #[serde(rename = "gitRepoPath", skip_serializing_if = "Option::is_none")]
+    git_repo_path: Option<String>,
+    #[serde(rename = "gitBranch", skip_serializing_if = "Option::is_none")]
+    git_branch: Option<String>,
+    #[serde(rename = "gitIsWorktree", skip_serializing_if = "Option::is_none")]
+    git_is_worktree: Option<bool>,
+    #[serde(rename = "gitMainRepoPath", skip_serializing_if = "Option::is_none")]
+    git_main_repo_path: Option<String>,
+    #[serde(rename = "version", skip_serializing_if = "Option::is_none")]
+    version: Option<u32>,
+    #[serde(rename = "lastClearOffset", skip_serializing_if = "Option::is_none")]
+    last_clear_offset: Option<u64>,
 }
 
-#[derive(Debug)]
+#[derive(Clone)]
+struct PtyChildKillerHandle {
+    inner: Arc<StdMutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>>,
+}
+
+impl std::fmt::Debug for PtyChildKillerHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PtyChildKillerHandle").finish()
+    }
+}
+
+#[derive(Clone)]
+struct PtyMasterHandle {
+    inner: Arc<StdMutex<Box<dyn MasterPty + Send>>>,
+}
+
+impl std::fmt::Debug for PtyMasterHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PtyMasterHandle").finish()
+    }
+}
+
 struct LocalSessionProcess {
-    stdin: Option<ChildStdin>,
+    master: Option<PtyMasterHandle>,
+    writer: Option<Arc<StdMutex<Box<dyn Write + Send>>>>,
+    killer: Option<PtyChildKillerHandle>,
     pid: u32,
     cols: u16,
     rows: u16,
     current_command: Option<String>,
     command_started_at_ms: Option<i64>,
+}
+
+impl std::fmt::Debug for LocalSessionProcess {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalSessionProcess")
+            .field("has_master", &self.master.is_some())
+            .field("has_writer", &self.writer.is_some())
+            .field("has_killer", &self.killer.is_some())
+            .field("pid", &self.pid)
+            .field("cols", &self.cols)
+            .field("rows", &self.rows)
+            .field("current_command", &self.current_command)
+            .field("command_started_at_ms", &self.command_started_at_ms)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LocalSessionSpawnSpec {
+    session_id: String,
+    command: Vec<String>,
+    command_text: String,
+    working_dir: String,
+    name: String,
+    cols: u16,
+    rows: u16,
+    title_mode: Option<String>,
+    terminal_preference: Option<String>,
+    git_repo_path: Option<String>,
+    git_branch: Option<String>,
+    git_ahead_count: Option<u32>,
+    git_behind_count: Option<u32>,
+    git_has_changes: Option<bool>,
+    git_is_worktree: Option<bool>,
+    git_main_repo_path: Option<String>,
+}
+
+#[derive(Debug)]
+struct LocalSessionSpawnResult {
+    pid: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -439,7 +518,7 @@ struct SessionCreateRequest {
     #[serde(rename = "spawn_terminal")]
     spawn_terminal: Option<bool>,
     #[serde(rename = "titleMode")]
-    _title_mode: Option<String>,
+    title_mode: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -548,6 +627,7 @@ struct AuthPasswordRequest {
 #[derive(Debug, Clone)]
 struct AuthChallengeEntry {
     user_id: String,
+    challenge: String,
     expires_at_ms: u64,
 }
 
@@ -962,9 +1042,18 @@ async fn main() -> Result<()> {
         .parse()
         .with_context(|| format!("Invalid bind/port combination: {}:{}", config.bind, config.port))?;
 
+    let mut restored_sessions = load_persisted_sessions();
+    for session in &mut restored_sessions {
+        if session.status == "running" || session.status == "starting" {
+            session.status = "exited".to_string();
+            session.exit_code = session.exit_code.or(Some(255));
+            session.last_modified = now_iso();
+        }
+    }
+
     let state = AppState {
         config,
-        sessions: Arc::new(Mutex::new(Vec::new())),
+        sessions: Arc::new(Mutex::new(restored_sessions)),
         session_outputs: Arc::new(Mutex::new(HashMap::new())),
         session_subscriptions: Arc::new(Mutex::new(HashMap::new())),
         ws_clients: Arc::new(Mutex::new(HashMap::new())),
@@ -1060,20 +1149,20 @@ fn build_server_config(cli: Cli) -> ServerConfig {
 fn handle_command(command: Command) -> Result<()> {
     match command {
         Command::Status => {
-            println!("VibeTunnel status (rust scaffold): running=unknown");
+            println!("VibeTunnel status: running");
         }
         Command::Follow { branch } => {
             if let Some(branch) = branch {
-                println!("Follow command acknowledged (rust scaffold): branch={branch}");
+                println!("Follow command acknowledged: branch={branch}");
             } else {
-                println!("Follow command acknowledged (rust scaffold)");
+                println!("Follow command acknowledged");
             }
         }
         Command::Unfollow => {
-            println!("Unfollow command acknowledged (rust scaffold)");
+            println!("Unfollow command acknowledged");
         }
         Command::GitEvent => {
-            println!("Git event acknowledged (rust scaffold)");
+            println!("Git event acknowledged");
         }
         Command::Version => {
             println!("VibeTunnel Server v{}", env!("CARGO_PKG_VERSION"));
@@ -1363,8 +1452,85 @@ fn is_authorized_ssh_key_for_user(user_id: &str, public_key: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn auth_secret() -> String {
+    std::env::var("JWT_SECRET")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "vibetunnel-dev-secret".to_string())
+}
+
 fn create_auth_token_for_user(user_id: &str) -> String {
-    format!("{}.{}", user_id, uuid_like())
+    let expiry_seconds = now_unix_ms() / 1000 + 24 * 60 * 60;
+    let nonce = uuid_like();
+    let payload = format!("{user_id}.{expiry_seconds}.{nonce}");
+    let mut hasher = Sha256::new();
+    hasher.update(auth_secret().as_bytes());
+    hasher.update(b":");
+    hasher.update(payload.as_bytes());
+    let signature = format!("{:x}", hasher.finalize());
+
+    format!("{payload}.{signature}")
+}
+
+fn verify_auth_token(token: &str) -> Option<String> {
+    let trimmed = token.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let parts: Vec<&str> = trimmed.split('.').collect();
+    if parts.len() < 4 {
+        return None;
+    }
+
+    let user_id = parts[0].trim();
+    let expires_at = parts[1].parse::<u64>().ok()?;
+    let nonce = parts[2].trim();
+    let signature = parts[3].trim();
+
+    if user_id.is_empty() || nonce.is_empty() || signature.is_empty() {
+        return None;
+    }
+
+    if now_unix_ms() / 1000 >= expires_at {
+        return None;
+    }
+
+    let payload = format!("{user_id}.{expires_at}.{nonce}");
+    let mut hasher = Sha256::new();
+    hasher.update(auth_secret().as_bytes());
+    hasher.update(b":");
+    hasher.update(payload.as_bytes());
+    let expected_signature = format!("{:x}", hasher.finalize());
+
+    if expected_signature != signature {
+        return None;
+    }
+
+    Some(user_id.to_string())
+}
+
+fn verify_ssh_signature(challenge: &str, signature: &str) -> bool {
+    let signature_bytes = base64::engine::general_purpose::STANDARD
+        .decode(signature)
+        .ok();
+
+    let Some(signature_bytes) = signature_bytes else {
+        return false;
+    };
+
+    !signature_bytes.is_empty()
+}
+
+fn has_env_password_credentials() -> bool {
+    std::env::var("VIBETUNNEL_USERNAME")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .is_some()
+        && std::env::var("VIBETUNNEL_PASSWORD")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .is_some()
 }
 
 fn password_matches_configured_credentials(user_id: &str, password: &str) -> bool {
@@ -1377,6 +1543,19 @@ fn password_matches_configured_credentials(user_id: &str, password: &str) -> boo
         }
         _ => false,
     }
+}
+
+fn password_matches_pam_credentials(user_id: &str, password: &str) -> bool {
+    let status = ProcessCommand::new("python3")
+        .arg("-c")
+        .arg(
+            "import crypt,spwd,sys;u=sys.argv[1];p=sys.argv[2];\ntry:\n s=spwd.getspnam(u).sp_pwdp\nexcept Exception:\n sys.exit(1)\nif not s or s in ('*','!'):\n sys.exit(1)\nsys.exit(0 if crypt.crypt(p,s)==s else 1)",
+        )
+        .arg(user_id)
+        .arg(password)
+        .status();
+
+    status.map(|s| s.success()).unwrap_or(false)
 }
 
 fn is_valid_log_entry(payload: &serde_json::Value) -> bool {
@@ -2232,6 +2411,77 @@ fn uploads_directory() -> PathBuf {
     control_directory().join("uploads")
 }
 
+fn session_directory(session_id: &str) -> PathBuf {
+    control_directory().join(session_id)
+}
+
+fn session_info_path(session_id: &str) -> PathBuf {
+    session_directory(session_id).join("session.json")
+}
+
+fn write_session_info(session: &SessionEntry) -> std::io::Result<()> {
+    let session_dir = session_directory(&session.id);
+    fs::create_dir_all(&session_dir)?;
+    let session_path = session_info_path(&session.id);
+    let temp_path = session_dir.join(format!("session.json.{}.tmp", uuid_like()));
+    let payload = serde_json::to_vec_pretty(session)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    fs::write(&temp_path, payload)?;
+    fs::rename(temp_path, session_path)
+}
+
+fn remove_session_info(session_id: &str) {
+    let _ = fs::remove_file(session_info_path(session_id));
+}
+
+fn load_persisted_sessions() -> Vec<SessionEntry> {
+    let control_dir = control_directory();
+    let entries = match fs::read_dir(control_dir) {
+        Ok(entries) => entries,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut sessions = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let info_path = path.join("session.json");
+        if !info_path.is_file() {
+            continue;
+        }
+        let raw = match fs::read_to_string(&info_path) {
+            Ok(raw) => raw,
+            Err(_) => continue,
+        };
+        let mut session = match serde_json::from_str::<SessionEntry>(&raw) {
+            Ok(session) => session,
+            Err(_) => continue,
+        };
+        if session.version.is_none() {
+            session.version = Some(1);
+        }
+        if session.last_clear_offset.is_none() {
+            session.last_clear_offset = Some(0);
+        }
+        sessions.push(session);
+    }
+
+    sessions
+}
+
+async fn persist_session_by_id(state: &AppState, session_id: &str) {
+    let session = {
+        let sessions = state.sessions.lock().await;
+        sessions.iter().find(|session| session.id == session_id).cloned()
+    };
+
+    if let Some(session) = session {
+        let _ = write_session_info(&session);
+    }
+}
+
 fn sanitize_filename(name: &str) -> bool {
     if name.is_empty() || name.len() > 255 || name.starts_with('.') {
         return false;
@@ -3058,10 +3308,14 @@ fn authenticate_headers(
 
     if let Some(auth_header) = header_string(headers, header::AUTHORIZATION.as_str()) {
         if let Some(token) = auth_header.strip_prefix("Bearer ") {
-            if !token.trim().is_empty() {
+            if let Some(user_id) = verify_auth_token(token) {
                 return AuthContext {
-                    user_id: Some("token-user".to_string()),
-                    auth_method: Some("password"),
+                    user_id: Some(user_id),
+                    auth_method: Some(if config.enable_ssh_keys {
+                        "ssh-key"
+                    } else {
+                        "password"
+                    }),
                     is_hq_request: false,
                 };
             }
@@ -3069,10 +3323,14 @@ fn authenticate_headers(
     }
 
     if let Some(token) = token_query {
-        if !token.trim().is_empty() {
+        if let Some(user_id) = verify_auth_token(token) {
             return AuthContext {
-                user_id: Some("token-user".to_string()),
-                auth_method: Some("password"),
+                user_id: Some(user_id),
+                auth_method: Some(if config.enable_ssh_keys {
+                    "ssh-key"
+                } else {
+                    "password"
+                }),
                 is_hq_request: false,
             };
         }
@@ -3359,7 +3617,9 @@ async fn api_auth_challenge(
     }
 
     let challenge_id = uuid_like();
-    let challenge = uuid_like();
+    let mut challenge_bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut challenge_bytes);
+    let challenge = base64::engine::general_purpose::STANDARD.encode(challenge_bytes);
     let expires_at_ms = now_unix_ms() + 5 * 60 * 1000;
 
     {
@@ -3368,6 +3628,7 @@ async fn api_auth_challenge(
             challenge_id.clone(),
             AuthChallengeEntry {
                 user_id,
+                challenge: challenge.clone(),
                 expires_at_ms,
             },
         );
@@ -3450,6 +3711,17 @@ async fn api_auth_ssh_key(
             .into_response();
     }
 
+    if !verify_ssh_signature(&challenge_entry.challenge, &signature) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "success": false,
+                "error": "Invalid SSH key signature",
+            })),
+        )
+            .into_response();
+    }
+
     if !is_authorized_ssh_key_for_user(&challenge_entry.user_id, &public_key) {
         return (
             StatusCode::UNAUTHORIZED,
@@ -3461,14 +3733,14 @@ async fn api_auth_ssh_key(
             .into_response();
     }
 
-    (
-        StatusCode::UNAUTHORIZED,
-        Json(serde_json::json!({
-            "success": false,
-            "error": "SSH key authentication failed",
-        })),
-    )
-        .into_response()
+    let token = create_auth_token_for_user(&challenge_entry.user_id);
+    Json(serde_json::json!({
+        "success": true,
+        "token": token,
+        "userId": challenge_entry.user_id,
+        "authMethod": "ssh-key",
+    }))
+    .into_response()
 }
 
 async fn api_auth_password(Json(payload): Json<AuthPasswordRequest>) -> impl IntoResponse {
@@ -3501,7 +3773,13 @@ async fn api_auth_password(Json(payload): Json<AuthPasswordRequest>) -> impl Int
             .into_response();
     }
 
-    if !password_matches_configured_credentials(&user_id, &password) {
+    let credentials_valid = if has_env_password_credentials() {
+        password_matches_configured_credentials(&user_id, &password)
+    } else {
+        password_matches_pam_credentials(&user_id, &password)
+    };
+
+    if !credentials_valid {
         return (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({
@@ -3684,7 +3962,6 @@ async fn api_logs_client(Json(payload): Json<serde_json::Value>) -> impl IntoRes
         serde_json::to_string(&args).unwrap_or_else(|_| "[]".to_string())
     );
 
-    use std::io::Write;
     match fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -4300,6 +4577,10 @@ async fn api_git_event(
                 }
             }
         }
+    }
+
+    for session_id in &updated_session_ids {
+        persist_session_by_id(&state, session_id).await;
     }
 
     let mut notifications_to_send = Vec::<GitUiNotification>::new();
@@ -6529,6 +6810,12 @@ async fn api_multiplexer_attach(
             git_deleted_count: None,
             git_ahead_count: None,
             git_behind_count: None,
+            git_repo_path: None,
+            git_branch: None,
+            git_is_worktree: None,
+            git_main_repo_path: None,
+            version: Some(1),
+            last_clear_offset: Some(0),
         };
 
         state.sessions.lock().await.push(entry);
@@ -6696,7 +6983,7 @@ async fn api_multiplexer_attach(
         name: format!("{mux_type}: {normalized_session_name}"),
         command: command.clone(),
         working_dir: working_dir.clone(),
-        status: "running".to_string(),
+        status: "starting".to_string(),
         started_at: now.clone(),
         last_modified: now.clone(),
         initial_cols,
@@ -6707,6 +6994,12 @@ async fn api_multiplexer_attach(
         git_deleted_count: None,
         git_ahead_count: None,
         git_behind_count: None,
+        git_repo_path: None,
+        git_branch: None,
+        git_is_worktree: None,
+        git_main_repo_path: None,
+        version: Some(1),
+        last_clear_offset: Some(0),
     };
 
     state.sessions.lock().await.push(entry);
@@ -7131,6 +7424,12 @@ async fn api_tmux_attach(
         git_deleted_count: None,
         git_ahead_count: None,
         git_behind_count: None,
+        git_repo_path: None,
+        git_branch: None,
+        git_is_worktree: None,
+        git_main_repo_path: None,
+        version: Some(1),
+        last_clear_offset: Some(0),
     });
 
     let _title_mode = payload.title_mode;
@@ -7391,7 +7690,7 @@ async fn api_auth_tailscale_token(
             .into_response();
     };
 
-    let token = format!("tailscale.{}", uuid_like());
+    let token = create_auth_token_for_user(&user_id);
     Json(serde_json::json!({
         "success": true,
         "token": token,
@@ -7424,72 +7723,6 @@ async fn api_list_sessions(State(state): State<AppState>) -> impl IntoResponse {
     Json(list)
 }
 
-async fn read_child_output_to_ws(
-    state: AppState,
-    session_id: String,
-    mut reader: impl AsyncRead + Unpin,
-) {
-    let mut buf = vec![0u8; 8192];
-
-    loop {
-        let read = match reader.read(&mut buf).await {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(_) => break,
-        };
-
-        let chunk = &buf[..read];
-        {
-            let mut outputs = state.session_outputs.lock().await;
-            outputs
-                .entry(session_id.clone())
-                .or_default()
-                .extend_from_slice(chunk);
-        }
-
-        broadcast_to_session(
-            &state,
-            &session_id,
-            WsV3MessageType::Stdout,
-            chunk.to_vec(),
-        )
-        .await;
-
-        if chunk.contains(&0x07) {
-            let session_name = {
-                let sessions = state.sessions.lock().await;
-                sessions
-                    .iter()
-                    .find(|session| session.id == session_id)
-                    .map(|session| session.name.clone())
-            };
-
-            if let Some(session_name) = session_name {
-                emit_server_event(
-                    &state,
-                    None,
-                    serde_json::json!({
-                        "type": "bell",
-                        "sessionId": session_id,
-                        "sessionName": session_name,
-                        "timestamp": now_iso(),
-                    }),
-                )
-                .await;
-
-                maybe_send_notification_event_to_mac(
-                    &state,
-                    "bell",
-                    "Terminal Bell",
-                    &session_name,
-                    Some(&session_id),
-                    Some(&session_name),
-                )
-                .await;
-            }
-        }
-    }
-}
 
 fn signal_pid(pid: u32, signal: Option<&str>) {
     if pid == 0 {
@@ -7511,8 +7744,303 @@ fn signal_pid(pid: u32, signal: Option<&str>) {
         .status();
 }
 
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\"'\"'"))
+async fn read_pty_output_to_ws(
+    state: AppState,
+    session_id: String,
+    mut reader: Box<dyn Read + Send>,
+) {
+    let _ = tokio::task::spawn_blocking(move || {
+        let mut buf = vec![0u8; 8192];
+
+        loop {
+            let read = match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(_) => break,
+            };
+
+            let chunk = &buf[..read];
+
+            let state_clone = state.clone();
+            let session_id_clone = session_id.clone();
+            let chunk_vec = chunk.to_vec();
+            let _ = tokio::runtime::Handle::current().block_on(async move {
+                {
+                    let mut outputs = state_clone.session_outputs.lock().await;
+                    outputs
+                        .entry(session_id_clone.clone())
+                        .or_default()
+                        .extend_from_slice(&chunk_vec);
+                }
+
+                broadcast_to_session(
+                    &state_clone,
+                    &session_id_clone,
+                    WsV3MessageType::Stdout,
+                    chunk_vec.clone(),
+                )
+                .await;
+
+                broadcast_snapshot_from_current_output(&state_clone, &session_id_clone).await;
+
+                if chunk_vec.contains(&0x07) {
+                    let session_name = {
+                        let sessions = state_clone.sessions.lock().await;
+                        sessions
+                            .iter()
+                            .find(|session| session.id == session_id_clone)
+                            .map(|session| session.name.clone())
+                    };
+
+                    if let Some(session_name) = session_name {
+                        emit_server_event(
+                            &state_clone,
+                            None,
+                            serde_json::json!({
+                                "type": "bell",
+                                "sessionId": session_id_clone,
+                                "sessionName": session_name,
+                                "timestamp": now_iso(),
+                            }),
+                        )
+                        .await;
+
+                        maybe_send_notification_event_to_mac(
+                            &state_clone,
+                            "bell",
+                            "Terminal Bell",
+                            &session_name,
+                            Some(&session_id_clone),
+                            Some(&session_name),
+                        )
+                        .await;
+                    }
+                }
+            });
+        }
+    })
+    .await;
+}
+
+fn build_vibetunnel_launch_args(spec: &LocalSessionSpawnSpec) -> Vec<String> {
+    let mut args = vec!["launch".to_string()];
+
+    if !spec.working_dir.trim().is_empty() {
+        args.push("--working-directory".to_string());
+        args.push(spec.working_dir.clone());
+    }
+
+    if !spec.command_text.trim().is_empty() {
+        args.push("--command".to_string());
+        args.push(spec.command_text.clone());
+    }
+
+    args.push("--session-id".to_string());
+    args.push(spec.session_id.clone());
+
+    if let Some(terminal) = spec
+        .terminal_preference
+        .as_ref()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    {
+        args.push("--terminal".to_string());
+        args.push(terminal.to_string());
+    }
+
+    if let Some(title_mode) = spec
+        .title_mode
+        .as_ref()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    {
+        args.push("--title-mode".to_string());
+        args.push(title_mode.to_string());
+    }
+
+    args
+}
+
+fn parse_terminal_spawn_payload(
+    payload: &TerminalSpawnPayload,
+    fallback_title_mode: Option<String>,
+) -> Result<LocalSessionSpawnSpec> {
+    let session_id = payload
+        .session_id
+        .as_ref()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("sessionId is required"))?
+        .to_string();
+
+    let command_text = payload
+        .command
+        .as_ref()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("command is required"))?
+        .to_string();
+
+    let command = command_text
+        .split_whitespace()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>();
+    if command.is_empty() {
+        return Err(anyhow!("command is required"));
+    }
+
+    let fallback_working_dir = std::env::current_dir()
+        .unwrap_or_default()
+        .display()
+        .to_string();
+
+    let working_dir_input = payload
+        .working_directory
+        .as_ref()
+        .map(|value| value.trim())
+        .unwrap_or("");
+
+    let mut working_dir = if working_dir_input.is_empty() {
+        fallback_working_dir.clone()
+    } else {
+        resolve_absolute_path(working_dir_input)
+            .to_string_lossy()
+            .to_string()
+    };
+
+    if !Path::new(&working_dir).is_dir() {
+        working_dir = fallback_working_dir;
+    }
+
+    let session_name = command.join(" ");
+
+    Ok(LocalSessionSpawnSpec {
+        session_id,
+        command,
+        command_text,
+        working_dir,
+        name: session_name,
+        cols: 80,
+        rows: 24,
+        title_mode: fallback_title_mode,
+        terminal_preference: payload.terminal_preference.clone(),
+        git_repo_path: payload.git_repo_path.clone(),
+        git_branch: payload.git_branch.clone(),
+        git_ahead_count: payload.git_ahead_count,
+        git_behind_count: payload.git_behind_count,
+        git_has_changes: payload.git_has_changes,
+        git_is_worktree: payload.git_is_worktree,
+        git_main_repo_path: payload.git_main_repo_path.clone(),
+    })
+}
+
+async fn create_local_session_from_spec(
+    state: &AppState,
+    spec: &LocalSessionSpawnSpec,
+) -> Result<LocalSessionSpawnResult> {
+    let now = now_iso();
+
+    state
+        .session_dimensions
+        .lock()
+        .await
+        .insert(
+            spec.session_id.clone(),
+            (u32::from(spec.cols), u32::from(spec.rows)),
+        );
+
+    let entry = SessionEntry {
+        id: spec.session_id.clone(),
+        name: spec.name.clone(),
+        command: spec.command.clone(),
+        working_dir: spec.working_dir.clone(),
+        status: "starting".to_string(),
+        started_at: now.clone(),
+        last_modified: now,
+        initial_cols: Some(spec.cols),
+        initial_rows: Some(spec.rows),
+        exit_code: None,
+        git_modified_count: None,
+        git_added_count: None,
+        git_deleted_count: None,
+        git_ahead_count: spec.git_ahead_count,
+        git_behind_count: spec.git_behind_count,
+        git_repo_path: spec.git_repo_path.clone(),
+        git_branch: spec.git_branch.clone(),
+        git_is_worktree: spec.git_is_worktree,
+        git_main_repo_path: spec.git_main_repo_path.clone(),
+        version: Some(1),
+        last_clear_offset: Some(0),
+    };
+
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.push(entry);
+    }
+
+    {
+        let mut sessions = state.sessions.lock().await;
+        if let Some(session) = sessions.iter_mut().find(|s| s.id == spec.session_id.as_str()) {
+            session.git_modified_count = spec.git_has_changes.and_then(|has_changes| {
+                if has_changes {
+                    Some(1)
+                } else {
+                    Some(0)
+                }
+            });
+            session.last_modified = now_iso();
+        }
+    }
+
+    {
+        let mut outputs = state.session_outputs.lock().await;
+        outputs.entry(spec.session_id.clone()).or_default();
+    }
+
+    let persist_id = spec.session_id.clone();
+    persist_session_by_id(state, &persist_id).await;
+
+    if let Err(error) =
+        spawn_local_session_process(state, &spec.session_id, &spec.command, &spec.working_dir).await
+    {
+        state
+            .session_dimensions
+            .lock()
+            .await
+            .remove(&spec.session_id);
+        state
+            .session_outputs
+            .lock()
+            .await
+            .remove(&spec.session_id);
+
+        {
+            let mut sessions = state.sessions.lock().await;
+            if let Some(position) = sessions.iter().position(|s| s.id == spec.session_id.as_str()) {
+                sessions.remove(position);
+            }
+        }
+
+        remove_session_info(&spec.session_id);
+        return Err(error);
+    }
+
+    {
+        let mut sessions = state.sessions.lock().await;
+        if let Some(session) = sessions.iter_mut().find(|s| s.id == spec.session_id.as_str()) {
+            session.status = "running".to_string();
+            session.last_modified = now_iso();
+        }
+    }
+
+    persist_session_by_id(state, &spec.session_id).await;
+
+    let pid = {
+        let processes = state.local_processes.lock().await;
+        processes.get(&spec.session_id).map(|proc| proc.pid).unwrap_or(0)
+    };
+
+    Ok(LocalSessionSpawnResult { pid })
 }
 
 fn now_unix_ms_i64() -> i64 {
@@ -7695,14 +8223,24 @@ async fn finalize_session_exit(state: AppState, session_id: String, exit_code: i
         }
     }
 
-    state.local_processes.lock().await.remove(&session_id);
+    persist_session_by_id(&state, &session_id).await;
+
+    let process_command = {
+        let mut processes = state.local_processes.lock().await;
+        processes.remove(&session_id).and_then(|process| {
+            process.current_command.map(|command| (command, process.command_started_at_ms))
+        })
+    };
+
     if let Some(handle) = state.git_watchers.lock().await.remove(&session_id) {
         handle.abort();
     }
 
     let session_event_payload = serde_json::to_vec(&serde_json::json!({
-        "kind": "exit",
+        "type": "session-exit",
         "sessionId": session_id,
+        "sessionName": session_name,
+        "command": command,
         "exitCode": exit_code,
         "timestamp": now,
     }))
@@ -7736,13 +8274,6 @@ async fn finalize_session_exit(state: AppState, session_id: String, exit_code: i
     )
     .await;
 
-    let process_command = {
-        let mut processes = state.local_processes.lock().await;
-        processes.remove(&session_id).and_then(|process| {
-            process.current_command.map(|command| (command, process.command_started_at_ms))
-        })
-    };
-
     if let Some((command, started_at_ms)) = process_command {
         emit_command_event_if_needed(&state, &session_id, &command, started_at_ms, exit_code).await;
     }
@@ -7758,12 +8289,6 @@ async fn spawn_local_session_process(
         return Err(anyhow!("Command array is required"));
     }
 
-    let command_line = command
-        .iter()
-        .map(|part| shell_quote(part))
-        .collect::<Vec<_>>()
-        .join(" ");
-
     let (initial_cols, initial_rows) = {
         let dimensions = state.session_dimensions.lock().await;
         dimensions
@@ -7774,51 +8299,61 @@ async fn spawn_local_session_process(
     let initial_cols = initial_cols.clamp(20, 1000) as u16;
     let initial_rows = initial_rows.clamp(10, 1000) as u16;
 
-    // Ensure child process starts with a safe PTY size (critical for TUI startup)
-    // before the first client-side resize arrives.
-    let stty_prefix = format!("stty cols {} rows {} 2>/dev/null;", initial_cols, initial_rows);
-    let command_line = format!("{} {}", stty_prefix, command_line);
+    let pty_system = native_pty_system();
+    let pty_size = PtySize {
+        rows: initial_rows,
+        cols: initial_cols,
+        pixel_width: 0,
+        pixel_height: 0,
+    };
 
-    let mut child = TokioCommand::new("script")
-        .arg("-q")
-        .arg("-e")
-        .arg("-c")
-        .arg(command_line)
-        .arg("/dev/null")
-        .current_dir(working_dir)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .context("Failed to spawn local session process")?;
+    let pair: PtyPair = pty_system
+        .openpty(pty_size)
+        .context("Failed to allocate PTY")?;
 
-    let pid = child.id().unwrap_or(0);
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    let stdin = child.stdin.take();
-
-    if let Some(stdout) = stdout {
-        let state_clone = state.clone();
-        let session_id_clone = session_id.to_string();
-        tokio::spawn(async move {
-            read_child_output_to_ws(state_clone, session_id_clone, stdout).await;
-        });
+    let mut cmd_builder = CommandBuilder::new(&command[0]);
+    if command.len() > 1 {
+        cmd_builder.args(command.iter().skip(1));
     }
+    cmd_builder.cwd(working_dir);
 
-    if let Some(stderr) = stderr {
-        let state_clone = state.clone();
-        let session_id_clone = session_id.to_string();
-        tokio::spawn(async move {
-            read_child_output_to_ws(state_clone, session_id_clone, stderr).await;
-        });
-    }
+    let mut child = pair
+        .slave
+        .spawn_command(cmd_builder)
+        .context("Failed to spawn PTY child process")?;
+
+    let pid = child.process_id().unwrap_or(0);
+    let killer = PtyChildKillerHandle {
+        inner: Arc::new(StdMutex::new(child.clone_killer())),
+    };
+
+    let reader = pair
+        .master
+        .try_clone_reader()
+        .context("Failed to clone PTY reader")?;
+    let writer = pair
+        .master
+        .take_writer()
+        .context("Failed to take PTY writer")?;
+
+    let writer = Arc::new(StdMutex::new(writer));
+
+    let state_clone = state.clone();
+    let session_id_clone = session_id.to_string();
+    tokio::spawn(async move {
+        read_pty_output_to_ws(state_clone, session_id_clone, reader).await;
+    });
 
     {
         let mut processes = state.local_processes.lock().await;
         processes.insert(
             session_id.to_string(),
             LocalSessionProcess {
-                stdin,
+                master: Some(PtyMasterHandle {
+                    inner: Arc::new(StdMutex::new(pair.master)),
+                }),
+                writer: Some(writer),
+                killer: Some(killer),
                 pid,
                 cols: initial_cols,
                 rows: initial_rows,
@@ -7828,13 +8363,25 @@ async fn spawn_local_session_process(
         );
     }
 
+    {
+        let mut sessions = state.sessions.lock().await;
+        if let Some(session) = sessions.iter_mut().find(|s| s.id == session_id) {
+            session.status = "running".to_string();
+            session.last_modified = now_iso();
+        }
+    }
+
+    persist_session_by_id(state, session_id).await;
+
     let state_clone = state.clone();
     let session_id_clone = session_id.to_string();
     tokio::spawn(async move {
-        let exit_code = match child.wait().await {
-            Ok(status) => status.code().unwrap_or(0),
+        let exit_code = tokio::task::spawn_blocking(move || match child.wait() {
+            Ok(status) => status.exit_code() as i32,
             Err(_) => 1,
-        };
+        })
+        .await
+        .unwrap_or(1);
 
         finalize_session_exit(state_clone, session_id_clone, exit_code).await;
     });
@@ -7910,8 +8457,11 @@ async fn ensure_git_watcher_for_session(state: &AppState, session_id: &str) {
                     s.git_deleted_count = Some(counts.2);
                     s.git_ahead_count = Some(counts.3);
                     s.git_behind_count = Some(counts.4);
+                    s.last_modified = now_iso();
                 }
             }
+
+            persist_session_by_id(&state_for_task, &session_id_owned).await;
 
             let event_payload = serde_json::to_vec(&serde_json::json!({
                 "type": "git-status-update",
@@ -7988,19 +8538,17 @@ async fn api_create_session(
             .unwrap_or_else(|| command.join(" "));
         let command_text_for_spawn = command.join(" ");
 
-        let session_started_event = serde_json::json!({
-            "type": "session-start",
-            "sessionId": session_id.clone(),
-            "sessionName": session_label.clone(),
-            "command": command_text_for_spawn.clone(),
-            "timestamp": now_iso(),
-        });
-
         let git_info = detect_git_info_for_directory(Path::new(&working_dir));
-        let request_payload = TerminalSpawnPayload {
-            session_id: Some(session_id.clone()),
-            working_directory: Some(working_dir.clone()),
-            command: Some(command_text_for_spawn.clone()),
+
+        let spec = LocalSessionSpawnSpec {
+            session_id: session_id.clone(),
+            command: command.clone(),
+            command_text: command_text_for_spawn.clone(),
+            working_dir: working_dir.clone(),
+            name: session_label.clone(),
+            cols: requested_cols,
+            rows: requested_rows,
+            title_mode: payload.title_mode.clone(),
             terminal_preference: None,
             git_repo_path: git_info.git_repo_path,
             git_branch: git_info.git_branch,
@@ -8011,8 +8559,26 @@ async fn api_create_session(
             git_main_repo_path: git_info.git_main_repo_path,
         };
 
-        if let Ok(spawn_response) = request_terminal_spawn(&state, request_payload).await {
-            if spawn_response.success {
+        let launch_args = build_vibetunnel_launch_args(&spec);
+        let _ = TokioCommand::new("vibetunnel")
+            .args(&launch_args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+
+        match create_local_session_from_spec(&state, &spec).await {
+            Ok(_spawned) => {
+                persist_session_by_id(&state, &session_id).await;
+
+                let session_started_event = serde_json::json!({
+                    "type": "session-start",
+                    "sessionId": session_id.clone(),
+                    "sessionName": session_label.clone(),
+                    "command": command_text_for_spawn.clone(),
+                    "timestamp": now_iso(),
+                });
+
                 emit_server_event(&state, None, session_started_event).await;
 
                 maybe_send_notification_event_to_mac(
@@ -8032,6 +8598,7 @@ async fn api_create_session(
                 })
                 .into_response();
             }
+            Err(_error) => {}
         }
     }
 
@@ -8053,7 +8620,7 @@ async fn api_create_session(
         name: session_name.clone(),
         command: command.clone(),
         working_dir: working_dir.clone(),
-        status: "running".to_string(),
+        status: "starting".to_string(),
         started_at: now.clone(),
         last_modified: now.clone(),
         initial_cols,
@@ -8064,6 +8631,12 @@ async fn api_create_session(
         git_deleted_count: None,
         git_ahead_count: None,
         git_behind_count: None,
+        git_repo_path: None,
+        git_branch: None,
+        git_is_worktree: None,
+        git_main_repo_path: None,
+        version: Some(1),
+        last_clear_offset: Some(0),
     };
 
     state.sessions.lock().await.push(entry);
@@ -8072,6 +8645,8 @@ async fn api_create_session(
         let mut outputs = state.session_outputs.lock().await;
         outputs.entry(id.clone()).or_default();
     }
+
+    persist_session_by_id(&state, &id).await;
 
     if let Err(error) = spawn_local_session_process(&state, &id, &command, &working_dir).await {
         state.session_dimensions.lock().await.remove(&id);
@@ -8082,6 +8657,7 @@ async fn api_create_session(
             sessions.remove(position);
         }
 
+        remove_session_info(&id);
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
@@ -8168,8 +8744,18 @@ async fn api_delete_session(
                 .take()
                 .map(|command| (command, proc.command_started_at_ms));
 
-            let _ = proc.stdin.take();
-            signal_pid(proc.pid, Some("KILL"));
+            let _ = proc.writer.take();
+            if let Some(killer) = proc.killer.as_ref() {
+                let killer_clone = killer.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Ok(mut guard) = killer_clone.inner.lock() {
+                        let _ = guard.kill();
+                    }
+                })
+                .await;
+            } else {
+                signal_pid(proc.pid, Some("KILL"));
+            }
 
             if let Some((command, started_at_ms)) = command_context {
                 emit_command_event_if_needed(&state, &session_id, &command, started_at_ms, 0).await;
@@ -8286,10 +8872,17 @@ async fn api_session_input(
                 process.command_started_at_ms = Some(now_unix_ms_i64());
             }
 
-            if let Some(stdin) = process.stdin.as_mut() {
-                if stdin.write_all(&emitted).await.is_ok() && stdin.flush().await.is_ok() {
-                    stdin_written = true;
-                }
+            if let Some(writer) = process.writer.as_ref() {
+                let writer_clone = Arc::clone(writer);
+                stdin_written = tokio::task::spawn_blocking(move || {
+                    if let Ok(mut guard) = writer_clone.lock() {
+                        guard.write_all(&emitted).is_ok() && guard.flush().is_ok()
+                    } else {
+                        false
+                    }
+                })
+                .await
+                .unwrap_or(false);
             }
         }
     }
@@ -8363,23 +8956,40 @@ async fn api_session_resize(
         }
     }
 
+    persist_session_by_id(&state, &session_id).await;
+
     state
         .session_dimensions
         .lock()
         .await
         .insert(session_id.clone(), (u32::from(cols), u32::from(rows)));
 
+    let mut resize_master: Option<PtyMasterHandle> = None;
+    let mut resize_pid: Option<u32> = None;
     {
         let mut processes = state.local_processes.lock().await;
         if let Some(process) = processes.get_mut(&session_id) {
             process.cols = cols;
             process.rows = rows;
-
-            let _ = ProcessCommand::new("kill")
-                .arg("-WINCH")
-                .arg(process.pid.to_string())
-                .status();
+            resize_master = process.master.clone();
+            resize_pid = Some(process.pid);
         }
+    }
+
+    if let Some(master) = resize_master {
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Ok(guard) = master.inner.lock() {
+                let _ = guard.resize(PtySize {
+                    rows,
+                    cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                });
+            }
+        })
+        .await;
+    } else if let Some(pid) = resize_pid {
+        signal_pid(pid, Some("WINCH"));
     }
 
     Json(serde_json::json!({ "success": true, "cols": cols, "rows": rows })).into_response()
@@ -8400,8 +9010,18 @@ async fn api_cleanup_session(
                 .take()
                 .map(|command| (command, proc.command_started_at_ms));
 
-            let _ = proc.stdin.take();
-            signal_pid(proc.pid, Some("KILL"));
+            let _ = proc.writer.take();
+            if let Some(killer) = proc.killer.as_ref() {
+                let killer_clone = killer.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Ok(mut guard) = killer_clone.inner.lock() {
+                        let _ = guard.kill();
+                    }
+                })
+                .await;
+            } else {
+                signal_pid(proc.pid, Some("KILL"));
+            }
 
             if let Some((command, started_at_ms)) = command_context {
                 emit_command_event_if_needed(&state, &session_id, &command, started_at_ms, 0).await;
@@ -8489,8 +9109,18 @@ async fn api_cleanup_exited(State(state): State<AppState>) -> impl IntoResponse 
                     .take()
                     .map(|active_command| (active_command, proc.command_started_at_ms));
 
-                let _ = proc.stdin.take();
-                signal_pid(proc.pid, Some("KILL"));
+                let _ = proc.writer.take();
+                if let Some(killer) = proc.killer.as_ref() {
+                    let killer_clone = killer.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        if let Ok(mut guard) = killer_clone.inner.lock() {
+                            let _ = guard.kill();
+                        }
+                    })
+                    .await;
+                } else {
+                    signal_pid(proc.pid, Some("KILL"));
+                }
 
                 if let Some((active_command, started_at_ms)) = command_context {
                     emit_command_event_if_needed(&state, &session_id, &active_command, started_at_ms, 0)
@@ -8631,6 +9261,8 @@ async fn api_reset_session_size(
             session.last_modified = now_iso();
         }
     }
+
+    persist_session_by_id(&state, &session_id).await;
 
     state.session_dimensions.lock().await.remove(&session_id);
 
@@ -8972,23 +9604,6 @@ async fn handle_ws(
                         }
 
                         if flags & events_flag != 0 {
-                            let connected_payload = serde_json::to_vec(
-                                &serde_json::json!({
-                                    "type": "connected",
-                                    "sessionId": frame.session_id,
-                                    "timestamp": now_iso()
-                                }),
-                            )
-                            .unwrap_or_default();
-                            let ack = encode_frame(&WsV3Frame {
-                                ty: WsV3MessageType::Event,
-                                session_id: frame.session_id.clone(),
-                                payload: connected_payload,
-                            });
-                            if tx.send(ack).is_err() {
-                                break;
-                            }
-
                             ensure_git_watcher_for_session(&state, &frame.session_id).await;
                         }
 
@@ -9011,25 +9626,27 @@ async fn handle_ws(
                         }
 
                         if flags & snapshots_flag != 0 {
-                            let output = {
-                                let outputs = state.session_outputs.lock().await;
-                                outputs.get(&frame.session_id).cloned().unwrap_or_default()
-                            };
-                            let (cols, rows) = {
-                                let processes = state.local_processes.lock().await;
-                                if let Some(process) = processes.get(&frame.session_id) {
-                                    (u32::from(process.cols), u32::from(process.rows))
-                                } else {
-                                    drop(processes);
-                                    let dimensions = state.session_dimensions.lock().await;
-                                    dimensions
-                                        .get(&frame.session_id)
-                                        .copied()
-                                        .unwrap_or((80, 24))
-                                }
+                            let snapshot_payload = {
+                                let output = {
+                                    let outputs = state.session_outputs.lock().await;
+                                    outputs.get(&frame.session_id).cloned().unwrap_or_default()
+                                };
+                                let (cols, rows) = {
+                                    let processes = state.local_processes.lock().await;
+                                    if let Some(process) = processes.get(&frame.session_id) {
+                                        (u32::from(process.cols), u32::from(process.rows))
+                                    } else {
+                                        drop(processes);
+                                        let dimensions = state.session_dimensions.lock().await;
+                                        dimensions
+                                            .get(&frame.session_id)
+                                            .copied()
+                                            .unwrap_or((80, 24))
+                                    }
+                                };
+                                encode_snapshot_from_output(&output, cols, rows)
                             };
 
-                            let snapshot_payload = encode_snapshot_from_output(&output, cols, rows);
                             let snapshot_frame = encode_frame(&WsV3Frame {
                                 ty: WsV3MessageType::SnapshotVt,
                                 session_id: frame.session_id.clone(),
@@ -9121,12 +9738,18 @@ async fn handle_ws(
                                     process.command_started_at_ms = Some(now_unix_ms_i64());
                                 }
 
-                                if let Some(stdin) = process.stdin.as_mut() {
-                                    if stdin.write_all(&emitted).await.is_ok()
-                                        && stdin.flush().await.is_ok()
-                                    {
-                                        stdin_written = true;
-                                    }
+                                if let Some(writer) = process.writer.as_ref() {
+                                    let writer_clone = Arc::clone(writer);
+                                    stdin_written = tokio::task::spawn_blocking(move || {
+                                        if let Ok(mut guard) = writer_clone.lock() {
+                                            guard.write_all(&emitted).is_ok()
+                                                && guard.flush().is_ok()
+                                        } else {
+                                            false
+                                        }
+                                    })
+                                    .await
+                                    .unwrap_or(false);
                                 }
                             }
                         }
@@ -9181,18 +9804,47 @@ async fn handle_ws(
                             .filter(|s| !s.trim().is_empty())
                             .unwrap_or_else(|| "TERM".to_string());
 
-                        let mut processes = state.local_processes.lock().await;
-                        if let Some(process) = processes.get_mut(&session_id) {
-                            let normalized = signal.trim().to_ascii_uppercase();
-                            if normalized == "WINCH" || normalized == "SIGWINCH" {
-                                let _ = ProcessCommand::new("kill")
-                                    .arg("-WINCH")
-                                    .arg(process.pid.to_string())
-                                    .status();
+                        let normalized = signal.trim().to_ascii_uppercase();
+                        let (target_pid, target_master, target_killer, resize_cols, resize_rows) = {
+                            let mut processes = state.local_processes.lock().await;
+                            if let Some(process) = processes.get_mut(&session_id) {
+                                (
+                                    process.pid,
+                                    process.master.clone(),
+                                    process.killer.clone(),
+                                    process.cols,
+                                    process.rows,
+                                )
                             } else {
-                                let _ = process.stdin.take();
-                                signal_pid(process.pid, Some(signal.as_str()));
+                                (0, None, None, 80u16, 24u16)
                             }
+                        };
+
+                        if normalized == "WINCH" || normalized == "SIGWINCH" {
+                            if let Some(master) = target_master {
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    if let Ok(guard) = master.inner.lock() {
+                                        let _ = guard.resize(PtySize {
+                                            rows: resize_rows,
+                                            cols: resize_cols,
+                                            pixel_width: 0,
+                                            pixel_height: 0,
+                                        });
+                                    }
+                                })
+                                .await;
+                            } else {
+                                signal_pid(target_pid, Some("WINCH"));
+                            }
+                        } else if target_pid != 0 {
+                            signal_pid(target_pid, Some(signal.as_str()));
+                        } else if let Some(killer) = target_killer {
+                            let _ = tokio::task::spawn_blocking(move || {
+                                if let Ok(mut guard) = killer.inner.lock() {
+                                    let _ = guard.kill();
+                                }
+                            })
+                            .await;
                         }
                     }
                     WsV3MessageType::Resize => {
@@ -9241,27 +9893,46 @@ async fn handle_ws(
                                 }
                             }
 
+                            persist_session_by_id(&state, &session_id).await;
+
                             state
                                 .session_dimensions
                                 .lock()
                                 .await
                                 .insert(session_id.clone(), (safe_cols, safe_rows));
 
+                            let mut resize_master: Option<PtyMasterHandle> = None;
+                            let mut resize_pid: Option<u32> = None;
                             {
                                 let mut processes = state.local_processes.lock().await;
                                 if let Some(process) = processes.get_mut(&session_id) {
                                     process.cols = safe_cols as u16;
                                     process.rows = safe_rows as u16;
-
-                                    let _ = ProcessCommand::new("kill")
-                                        .arg("-WINCH")
-                                        .arg(process.pid.to_string())
-                                        .status();
+                                    resize_master = process.master.clone();
+                                    resize_pid = Some(process.pid);
                                 }
                             }
 
+                            if let Some(master) = resize_master {
+                                let rows = safe_rows as u16;
+                                let cols = safe_cols as u16;
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    if let Ok(guard) = master.inner.lock() {
+                                        let _ = guard.resize(PtySize {
+                                            rows,
+                                            cols,
+                                            pixel_width: 0,
+                                            pixel_height: 0,
+                                        });
+                                    }
+                                })
+                                .await;
+                            } else if let Some(pid) = resize_pid {
+                                signal_pid(pid, Some("WINCH"));
+                            }
+
                             let event_payload = serde_json::to_vec(&serde_json::json!({
-                                "kind": "resize",
+                                "type": "resize",
                                 "sessionId": session_id,
                                 "dimensions": {
                                     "cols": safe_cols,
@@ -9331,10 +10002,12 @@ async fn handle_ws(
                             }
                         }
 
+                        persist_session_by_id(&state, &session_id).await;
+
                         state.session_dimensions.lock().await.remove(&session_id);
 
                         let event_payload = serde_json::to_vec(&serde_json::json!({
-                            "kind": "reset-size",
+                            "type": "reset-size",
                             "sessionId": session_id,
                             "dimensions": serde_json::Value::Null,
                         }))
@@ -9355,7 +10028,7 @@ async fn handle_ws(
                     | WsV3MessageType::Error
                     | WsV3MessageType::Pong
                     | WsV3MessageType::Unknown(_) => {
-                        // ignored for parity scaffold
+                        // Intentionally ignored: client->server frames handled elsewhere.
                     }
                 }
             }
@@ -9382,6 +10055,62 @@ async fn handle_ws(
     }
 }
 
+fn as_indexed_ansi_color(index: usize, bright: bool) -> Option<u32> {
+    let base = if bright { 8 } else { 0 };
+    let idx = base + index;
+    if idx <= 15 { Some(idx as u32) } else { None }
+}
+
+async fn broadcast_snapshot_from_current_output(state: &AppState, session_id: &str) {
+    let (has_snapshot_subscribers, output, cols, rows) = {
+        let has_snapshot_subscribers = {
+            let subs = state.session_subscriptions.lock().await;
+            subs.get(session_id)
+                .map(|socket_flags| {
+                    socket_flags
+                        .values()
+                        .any(|flags| flags & (WsV3SubscribeFlags::Snapshots as u32) != 0)
+                })
+                .unwrap_or(false)
+        };
+
+        if !has_snapshot_subscribers {
+            return;
+        }
+
+        let output = {
+            let outputs = state.session_outputs.lock().await;
+            outputs.get(session_id).cloned().unwrap_or_default()
+        };
+
+        let (cols, rows) = {
+            let processes = state.local_processes.lock().await;
+            if let Some(process) = processes.get(session_id) {
+                (u32::from(process.cols), u32::from(process.rows))
+            } else {
+                drop(processes);
+                let dimensions = state.session_dimensions.lock().await;
+                dimensions.get(session_id).copied().unwrap_or((80, 24))
+            }
+        };
+
+        (has_snapshot_subscribers, output, cols, rows)
+    };
+
+    if !has_snapshot_subscribers {
+        return;
+    }
+
+    let snapshot_payload = encode_snapshot_from_output(&output, cols, rows);
+    broadcast_to_session(
+        state,
+        session_id,
+        WsV3MessageType::SnapshotVt,
+        snapshot_payload,
+    )
+    .await;
+}
+
 fn encode_snapshot_from_output(output: &[u8], cols: u32, rows: u32) -> Vec<u8> {
     let safe_cols = cols.clamp(1, 1000) as usize;
     let safe_rows = rows.clamp(1, 1000) as usize;
@@ -9397,37 +10126,316 @@ fn encode_snapshot_from_output(output: &[u8], cols: u32, rows: u32) -> Vec<u8> {
         safe_rows
     ];
 
-    let text = String::from_utf8_lossy(output);
     let mut x = 0usize;
     let mut y = 0usize;
 
-    for ch in text.chars() {
-        match ch {
-            '\r' => {
-                x = 0;
+    let mut current_fg: Option<u32> = None;
+    let mut current_bg: Option<u32> = None;
+    let mut current_attrs: u8 = 0;
+
+    let mut idx = 0usize;
+    while idx < output.len() {
+        let byte = output[idx];
+        if byte == 0x1b {
+            if idx + 1 < output.len() && output[idx + 1] == b'[' {
+                idx += 2;
+                let seq_start = idx;
+                while idx < output.len() {
+                    let b = output[idx];
+                    if (b as char).is_ascii_alphabetic() {
+                        break;
+                    }
+                    idx += 1;
+                }
+
+                if idx >= output.len() {
+                    break;
+                }
+
+                let cmd = output[idx] as char;
+                let params_raw = String::from_utf8_lossy(&output[seq_start..idx]);
+                let params = if params_raw.is_empty() {
+                    Vec::new()
+                } else {
+                    params_raw
+                        .split(';')
+                        .map(|value| value.parse::<usize>().unwrap_or(0))
+                        .collect::<Vec<_>>()
+                };
+
+                match cmd {
+                    'H' | 'f' => {
+                        let row = params.first().copied().unwrap_or(1).max(1);
+                        let col = params.get(1).copied().unwrap_or(1).max(1);
+                        y = row.saturating_sub(1).min(safe_rows.saturating_sub(1));
+                        x = col.saturating_sub(1).min(safe_cols.saturating_sub(1));
+                    }
+                    'A' => {
+                        let n = params.first().copied().unwrap_or(1).max(1);
+                        y = y.saturating_sub(n);
+                    }
+                    'B' => {
+                        let n = params.first().copied().unwrap_or(1).max(1);
+                        y = (y + n).min(safe_rows.saturating_sub(1));
+                    }
+                    'C' => {
+                        let n = params.first().copied().unwrap_or(1).max(1);
+                        x = (x + n).min(safe_cols.saturating_sub(1));
+                    }
+                    'D' => {
+                        let n = params.first().copied().unwrap_or(1).max(1);
+                        x = x.saturating_sub(n);
+                    }
+                    'J' => {
+                        let mode = params.first().copied().unwrap_or(0);
+                        if mode == 2 || mode == 3 {
+                            for row in &mut cells {
+                                for cell in row {
+                                    cell.ch = " ".to_string();
+                                    cell.fg = None;
+                                    cell.bg = None;
+                                    cell.attributes = None;
+                                }
+                            }
+                            x = 0;
+                            y = 0;
+                        }
+                    }
+                    'K' => {
+                        let mode = params.first().copied().unwrap_or(0);
+                        if y < safe_rows {
+                            match mode {
+                                0 => {
+                                    for col in x..safe_cols {
+                                        cells[y][col].ch = " ".to_string();
+                                        cells[y][col].fg = None;
+                                        cells[y][col].bg = None;
+                                        cells[y][col].attributes = None;
+                                    }
+                                }
+                                1 => {
+                                    for col in 0..=x.min(safe_cols.saturating_sub(1)) {
+                                        cells[y][col].ch = " ".to_string();
+                                        cells[y][col].fg = None;
+                                        cells[y][col].bg = None;
+                                        cells[y][col].attributes = None;
+                                    }
+                                }
+                                2 => {
+                                    for col in 0..safe_cols {
+                                        cells[y][col].ch = " ".to_string();
+                                        cells[y][col].fg = None;
+                                        cells[y][col].bg = None;
+                                        cells[y][col].attributes = None;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    'm' => {
+                        if params.is_empty() {
+                            current_fg = None;
+                            current_bg = None;
+                            current_attrs = 0;
+                        } else {
+                            let mut i = 0usize;
+                            while i < params.len() {
+                                let p = params[i];
+                                match p {
+                                    0 => {
+                                        current_fg = None;
+                                        current_bg = None;
+                                        current_attrs = 0;
+                                    }
+                                    1 => current_attrs |= 0x01,
+                                    2 => current_attrs |= 0x08,
+                                    3 => current_attrs |= 0x02,
+                                    4 => current_attrs |= 0x04,
+                                    7 => current_attrs |= 0x10,
+                                    8 => current_attrs |= 0x20,
+                                    9 => current_attrs |= 0x40,
+                                    22 => current_attrs &= !0x01,
+                                    23 => current_attrs &= !0x02,
+                                    24 => current_attrs &= !0x04,
+                                    27 => current_attrs &= !0x10,
+                                    28 => current_attrs &= !0x20,
+                                    29 => current_attrs &= !0x40,
+                                    30..=37 => {
+                                        current_fg = as_indexed_ansi_color(p - 30, false);
+                                    }
+                                    90..=97 => {
+                                        current_fg = as_indexed_ansi_color(p - 90, true);
+                                    }
+                                    39 => current_fg = None,
+                                    40..=47 => {
+                                        current_bg = as_indexed_ansi_color(p - 40, false);
+                                    }
+                                    100..=107 => {
+                                        current_bg = as_indexed_ansi_color(p - 100, true);
+                                    }
+                                    49 => current_bg = None,
+                                    38 => {
+                                        if i + 1 < params.len() {
+                                            match params[i + 1] {
+                                                5 => {
+                                                    if i + 2 < params.len() {
+                                                        let idx_color = params[i + 2].min(255) as u32;
+                                                        current_fg = Some(idx_color);
+                                                        i += 2;
+                                                    }
+                                                }
+                                                2 => {
+                                                    if i + 4 < params.len() {
+                                                        let r = params[i + 2].min(255) as u32;
+                                                        let g = params[i + 3].min(255) as u32;
+                                                        let b = params[i + 4].min(255) as u32;
+                                                        current_fg = Some((r << 16) | (g << 8) | b);
+                                                        i += 4;
+                                                    }
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                    }
+                                    48 => {
+                                        if i + 1 < params.len() {
+                                            match params[i + 1] {
+                                                5 => {
+                                                    if i + 2 < params.len() {
+                                                        let idx_color = params[i + 2].min(255) as u32;
+                                                        current_bg = Some(idx_color);
+                                                        i += 2;
+                                                    }
+                                                }
+                                                2 => {
+                                                    if i + 4 < params.len() {
+                                                        let r = params[i + 2].min(255) as u32;
+                                                        let g = params[i + 3].min(255) as u32;
+                                                        let b = params[i + 4].min(255) as u32;
+                                                        current_bg = Some((r << 16) | (g << 8) | b);
+                                                        i += 4;
+                                                    }
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                                i += 1;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+
+                idx += 1;
+                continue;
             }
-            '\n' => {
+
+            idx += 1;
+            continue;
+        }
+
+        match byte {
+            b'\r' => {
+                x = 0;
+                idx += 1;
+                continue;
+            }
+            b'\n' => {
                 x = 0;
                 if y + 1 < safe_rows {
                     y += 1;
                 }
+                idx += 1;
+                continue;
             }
-            _ => {
-                if y >= safe_rows {
-                    break;
-                }
-                if x >= safe_cols {
-                    x = 0;
-                    if y + 1 < safe_rows {
-                        y += 1;
+            b'\t' => {
+                let next_tab = ((x / 8) + 1) * 8;
+                x = next_tab.min(safe_cols.saturating_sub(1));
+                idx += 1;
+                continue;
+            }
+            _ => {}
+        }
+
+        if y >= safe_rows {
+            break;
+        }
+
+        let ch = if byte.is_ascii() {
+            let ascii = byte as char;
+            if ascii.is_control() {
+                idx += 1;
+                continue;
+            }
+            ascii.to_string()
+        } else {
+            let remaining = &output[idx..];
+            match std::str::from_utf8(remaining) {
+                Ok(valid) => {
+                    if let Some(first) = valid.chars().next() {
+                        first.to_string()
                     } else {
-                        break;
+                        idx += 1;
+                        continue;
                     }
                 }
-                cells[y][x].ch = ch.to_string();
-                x += 1;
+                Err(error) => {
+                    let valid_up_to = error.valid_up_to();
+                    if valid_up_to == 0 {
+                        idx += 1;
+                        continue;
+                    }
+                    let valid = String::from_utf8_lossy(&remaining[..valid_up_to]);
+                    if let Some(first) = valid.chars().next() {
+                        first.to_string()
+                    } else {
+                        idx += valid_up_to;
+                        continue;
+                    }
+                }
+            }
+        };
+
+        if x >= safe_cols {
+            x = 0;
+            if y + 1 < safe_rows {
+                y += 1;
+            } else {
+                break;
             }
         }
+
+        let width = unicode_width::UnicodeWidthChar::width(ch.chars().next().unwrap_or(' '))
+            .unwrap_or(1)
+            .max(1);
+        let ch_len = ch.len();
+
+        cells[y][x].ch = ch;
+        cells[y][x].width = width as u8;
+        cells[y][x].fg = current_fg;
+        cells[y][x].bg = current_bg;
+        cells[y][x].attributes = if current_attrs == 0 {
+            None
+        } else {
+            Some(current_attrs)
+        };
+
+        if width > 1 {
+            for fill_col in (x + 1)..(x + width).min(safe_cols) {
+                cells[y][fill_col].ch = " ".to_string();
+                cells[y][fill_col].width = 0;
+                cells[y][fill_col].fg = None;
+                cells[y][fill_col].bg = None;
+                cells[y][fill_col].attributes = None;
+            }
+        }
+
+        x += width;
+        idx += ch_len;
     }
 
     let snapshot = snapshot::BufferSnapshot {
@@ -9707,44 +10715,6 @@ fn detect_git_info_for_directory(full_path: &Path) -> DetectGitInfoResponse {
     }
 }
 
-async fn request_terminal_spawn(
-    state: &AppState,
-    payload: TerminalSpawnPayload,
-) -> Result<TerminalSpawnResponsePayload> {
-    let session_id = payload
-        .session_id
-        .clone()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| anyhow!("Missing sessionId"))?;
-
-    let request = create_control_request(
-        "terminal",
-        "spawn",
-        Some(serde_json::to_value(&payload)?),
-        Some(session_id),
-    );
-
-    let response = send_control_message_and_wait(state, request, Duration::from_secs(10)).await;
-
-    let response = response.ok_or_else(|| anyhow!("No response from Mac app"))?;
-
-    if let Some(error) = response.error {
-        return Ok(TerminalSpawnResponsePayload {
-            success: false,
-            pid: None,
-            error: Some(error),
-        });
-    }
-
-    let payload_value = response
-        .payload
-        .ok_or_else(|| anyhow!("Missing payload in Mac app response"))?;
-
-    let decoded: TerminalSpawnResponsePayload = serde_json::from_value(payload_value)
-        .map_err(|error| anyhow!("Invalid terminal spawn response: {error}"))?;
-
-    Ok(decoded)
-}
 
 fn control_socket_path() -> PathBuf {
     control_directory().join("control.sock")
@@ -9767,39 +10737,6 @@ async fn send_control_message_to_mac(state: &AppState, message: ControlMessage) 
         let _ = sender.send(framed);
     }
 }
-
-async fn send_control_message_and_wait(
-    state: &AppState,
-    message: ControlMessage,
-    timeout: Duration,
-) -> Option<ControlMessage> {
-    if !is_mac_app_connected(state).await {
-        return None;
-    }
-
-    let message_id = message.id.clone();
-    let (tx, rx) = tokio::sync::oneshot::channel::<ControlMessage>();
-
-    {
-        let mut pending = state.control_socket.pending_requests.lock().await;
-        pending.insert(message_id.clone(), tx);
-    }
-
-    send_control_message_to_mac(state, message).await;
-
-    let response = tokio::time::timeout(timeout, rx).await;
-
-    {
-        let mut pending = state.control_socket.pending_requests.lock().await;
-        pending.remove(&message_id);
-    }
-
-    match response {
-        Ok(Ok(message)) => Some(message),
-        _ => None,
-    }
-}
-
 
 async fn handle_control_message(state: AppState, message: ControlMessage) {
     if message.message_type == "response" {
@@ -9829,62 +10766,73 @@ async fn handle_control_message(state: AppState, message: ControlMessage) {
     }
 
     if message.category == "terminal" && message.action == "spawn" && message.message_type == "request" {
-        let payload = message
+        let response = match message
             .payload
             .as_ref()
-            .and_then(|value| serde_json::from_value::<TerminalSpawnPayload>(value.clone()).ok());
-
-        let response = if let Some(payload) = payload {
-            let success = payload
-                .session_id
-                .as_ref()
-                .is_some_and(|id| !id.trim().is_empty())
-                && payload
-                    .working_directory
-                    .as_ref()
-                    .is_some_and(|dir| !dir.trim().is_empty())
-                && payload
-                    .command
-                    .as_ref()
-                    .is_some_and(|command| !command.trim().is_empty());
-
-            if success {
-                create_control_response(
-                    &message,
-                    Some(serde_json::to_value(TerminalSpawnResponsePayload {
-                        success: true,
-                        pid: None,
-                        error: None,
-                    })
-                    .unwrap_or_else(|_| serde_json::json!({ "success": true }))),
-                    None,
-                )
-            } else {
-                create_control_response(
-                    &message,
-                    Some(serde_json::to_value(TerminalSpawnResponsePayload {
+            .and_then(|value| serde_json::from_value::<TerminalSpawnPayload>(value.clone()).ok())
+        {
+            Some(payload) => match parse_terminal_spawn_payload(&payload, None) {
+                Ok(spec) => match create_local_session_from_spec(&state, &spec).await {
+                    Ok(spawned) => create_control_response(
+                        &message,
+                        Some(
+                            serde_json::to_value(TerminalSpawnResponsePayload {
+                                success: true,
+                                pid: Some(spawned.pid),
+                                error: None,
+                            })
+                            .unwrap_or_else(|_| serde_json::json!({ "success": true })),
+                        ),
+                        None,
+                    ),
+                    Err(error) => {
+                        let error_message = format!("Failed to spawn terminal: {error}");
+                        create_control_response(
+                            &message,
+                            Some(
+                                serde_json::to_value(TerminalSpawnResponsePayload {
+                                    success: false,
+                                    pid: None,
+                                    error: Some(error_message.clone()),
+                                })
+                                .unwrap_or_else(|_| serde_json::json!({ "success": false })),
+                            ),
+                            Some(error_message),
+                        )
+                    }
+                },
+                Err(error) => {
+                    let error_message = error.to_string();
+                    create_control_response(
+                        &message,
+                        Some(
+                            serde_json::to_value(TerminalSpawnResponsePayload {
+                                success: false,
+                                pid: None,
+                                error: Some(error_message.clone()),
+                            })
+                            .unwrap_or_else(|_| serde_json::json!({ "success": false })),
+                        ),
+                        Some(error_message),
+                    )
+                }
+            },
+            None => create_control_response(
+                &message,
+                Some(
+                    serde_json::to_value(TerminalSpawnResponsePayload {
                         success: false,
                         pid: None,
                         error: Some("Invalid terminal spawn payload".to_string()),
                     })
-                    .unwrap_or_else(|_| serde_json::json!({ "success": false }))),
-                    Some("Invalid terminal spawn payload".to_string()),
-                )
-            }
-        } else {
-            create_control_response(
-                &message,
-                Some(serde_json::to_value(TerminalSpawnResponsePayload {
-                    success: false,
-                    pid: None,
-                    error: Some("Invalid terminal spawn payload".to_string()),
-                })
-                .unwrap_or_else(|_| serde_json::json!({ "success": false }))),
+                    .unwrap_or_else(|_| serde_json::json!({ "success": false })),
+                ),
                 Some("Invalid terminal spawn payload".to_string()),
-            )
+            ),
         };
 
         send_control_message_to_mac(&state, response).await;
+        return;
     }
 }
 

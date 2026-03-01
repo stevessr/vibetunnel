@@ -215,8 +215,9 @@ describe('WsV3Hub', () => {
     const exitEvt = decodeLastFrame(ws);
     expect(exitEvt.type).toBe(WsV3MessageType.EVENT);
     expect(exitEvt.sessionId).toBe('s1');
-    expect(JSON.parse(new TextDecoder().decode(exitEvt.payload))).toEqual({
-      kind: 'exit',
+    expect(JSON.parse(new TextDecoder().decode(exitEvt.payload))).toMatchObject({
+      type: 'session-exit',
+      sessionId: 's1',
       exitCode: 0,
     });
 
@@ -226,6 +227,36 @@ describe('WsV3Hub', () => {
     expect(err.type).toBe(WsV3MessageType.ERROR);
     expect(err.sessionId).toBe('s1');
     expect(JSON.parse(new TextDecoder().decode(err.payload))).toEqual({ message: 'boom' });
+  });
+
+  it('forwards resize events as structured EVENT payloads when events are enabled', async () => {
+    const ws = new FakeWebSocket();
+    hub.handleClientConnection(ws as unknown as WebSocket, {} as unknown as WebSocketRequestV3);
+
+    sendBinaryFrame(
+      ws,
+      encodeWsV3Frame({
+        type: WsV3MessageType.SUBSCRIBE,
+        sessionId: 's1',
+        payload: encodeWsV3SubscribePayload({
+          flags: WsV3SubscribeFlags.Stdout | WsV3SubscribeFlags.Events,
+        }),
+      })
+    );
+    await flush();
+
+    if (!castListener) throw new Error('expected cast listener');
+    castListener({ kind: 'resize', dimensions: '132x47', historical: false });
+    await flush();
+
+    const resizeEvt = decodeLastFrame(ws);
+    expect(resizeEvt.type).toBe(WsV3MessageType.EVENT);
+    expect(resizeEvt.sessionId).toBe('s1');
+    expect(JSON.parse(new TextDecoder().decode(resizeEvt.payload))).toEqual({
+      type: 'resize',
+      sessionId: 's1',
+      dimensions: { cols: 132, rows: 47 },
+    });
   });
 
   it('forwards VT snapshots when subscribed', async () => {
@@ -375,14 +406,27 @@ describe('WsV3Hub', () => {
     expect(gitListener).toBeTypeOf('function');
 
     if (!gitListener) throw new Error('expected git listener');
-    gitListener({ kind: 'git-status-update', gitBranch: 'main' });
+    gitListener({
+      type: 'git-status-update',
+      sessionId: 's1',
+      gitModifiedCount: 3,
+      gitAddedCount: 1,
+      gitDeletedCount: 2,
+      gitAheadCount: 4,
+      gitBehindCount: 5,
+    });
     await flush();
     const evt = decodeLastFrame(ws);
     expect(evt.type).toBe(WsV3MessageType.EVENT);
     expect(evt.sessionId).toBe('s1');
     expect(JSON.parse(new TextDecoder().decode(evt.payload))).toMatchObject({
-      kind: 'git-status-update',
-      gitBranch: 'main',
+      type: 'git-status-update',
+      sessionId: 's1',
+      gitModifiedCount: 3,
+      gitAddedCount: 1,
+      gitDeletedCount: 2,
+      gitAheadCount: 4,
+      gitBehindCount: 5,
     });
   });
 });

@@ -258,7 +258,11 @@ export class WsV3Hub {
               type: WsV3MessageType.EVENT,
               sessionId,
               payload: utf8Encoder.encode(
-                JSON.stringify({ kind: 'exit', exitCode: event.exitCode })
+                JSON.stringify({
+                  type: 'session-exit',
+                  sessionId,
+                  exitCode: event.exitCode,
+                })
               ),
             })
           );
@@ -274,13 +278,23 @@ export class WsV3Hub {
         } else if (event.kind === 'resize') {
           // optional: send resize as event (clients may ignore to avoid loops)
           if (flags & WsV3SubscribeFlags.Events) {
+            const [cols, rows] = event.dimensions
+              .split('x')
+              .map((value) => Number.parseInt(value, 10));
             this.safeSend(
               ws,
               encodeWsV3Frame({
                 type: WsV3MessageType.EVENT,
                 sessionId,
                 payload: utf8Encoder.encode(
-                  JSON.stringify({ kind: 'resize', dimensions: event.dimensions })
+                  JSON.stringify({
+                    type: 'resize',
+                    sessionId,
+                    dimensions: {
+                      cols: Number.isFinite(cols) ? cols : 80,
+                      rows: Number.isFinite(rows) ? rows : 24,
+                    },
+                  })
                 ),
               })
             );
@@ -293,7 +307,11 @@ export class WsV3Hub {
                 type: WsV3MessageType.EVENT,
                 sessionId,
                 payload: utf8Encoder.encode(
-                  JSON.stringify({ kind: 'header', header: event.header })
+                  JSON.stringify({
+                    type: 'header',
+                    sessionId,
+                    header: event.header,
+                  })
                 ),
               })
             );
