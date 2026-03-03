@@ -507,7 +507,7 @@ struct NotificationPreferencesPatch {
     vibration_enabled: Option<bool>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct SessionCreateRequest {
     command: Vec<String>,
     #[serde(rename = "workingDir")]
@@ -519,6 +519,8 @@ struct SessionCreateRequest {
     spawn_terminal: Option<bool>,
     #[serde(rename = "titleMode")]
     title_mode: Option<String>,
+    #[serde(rename = "remoteId")]
+    remote_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -530,19 +532,19 @@ struct SessionCreateResponse {
     message: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct SessionInputRequest {
     text: Option<String>,
     key: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct SessionResizeRequest {
     cols: Option<u16>,
     rows: Option<u16>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct SessionPatchRequest {
     name: Option<String>,
 }
@@ -7721,24 +7723,126 @@ async fn api_auth_tailscale_token(
 
 async fn api_list_sessions(State(state): State<AppState>) -> impl IntoResponse {
     let sessions = state.sessions.lock().await.clone();
-    let processes = state.local_processes.lock().await;
+    let pid_by_session_id: HashMap<String, u32> = {
+        let processes = state.local_processes.lock().await;
+        processes
+            .iter()
+            .map(|(session_id, process)| (session_id.clone(), process.pid))
+            .collect()
+    };
 
-    let list = sessions
+    let mut all_sessions = sessions
         .into_iter()
-        .map(|session| {
-            let pid = processes.get(&session.id).map(|p| p.pid);
+        .map(|mut session| {
+            let session_id = session.id.clone();
+
+            if session.git_repo_path.is_none() && !session.working_dir.trim().is_empty() {
+                let git_info = detect_git_info_for_directory(Path::new(&session.working_dir));
+                if session.git_repo_path.is_none() {
+                    session.git_repo_path = git_info.git_repo_path;
+                }
+                if session.git_branch.is_none() {
+                    session.git_branch = git_info.git_branch;
+                }
+                if session.git_ahead_count.is_none() {
+                    session.git_ahead_count = git_info.git_ahead_count;
+                }
+                if session.git_behind_count.is_none() {
+                    session.git_behind_count = git_info.git_behind_count;
+                }
+                if session.git_is_worktree.is_none() {
+                    session.git_is_worktree = git_info.git_is_worktree;
+                }
+                if session.git_main_repo_path.is_none() {
+                    session.git_main_repo_path = git_info.git_main_repo_path;
+                }
+            }
+
+            let pid = pid_by_session_id.get(&session_id).copied();
             let mut value = serde_json::to_value(session).unwrap_or_else(|_| serde_json::json!({}));
             if let Some(map) = value.as_object_mut() {
                 map.insert(
                     "pid".to_string(),
                     pid.map_or(serde_json::Value::Null, |id| serde_json::json!(id)),
                 );
+                map.insert("source".to_string(), serde_json::json!("local"));
             }
             value
         })
         .collect::<Vec<_>>();
 
-    Json(list)
+    if state.config.is_hq_mode {
+        let remotes = state.remote_registry.lock().await.clone();
+        let fetches = remotes.into_iter().map(|remote| async move {
+            let remote_id = remote.id.clone();
+            let remote_name = remote.name.clone();
+            let remote_url = remote.url.clone();
+
+            let response = TokioCommand::new("curl")
+                .arg("-sS")
+                .arg("--max-time")
+                .arg("5")
+                .arg("-H")
+                .arg(format!("Authorization: Bearer {}", remote.token))
+                .arg("-w")
+                .arg("\n__VT_HTTP_STATUS__:%{http_code}")
+                .arg(format!("{}/api/sessions", remote_url.trim_end_matches('/')))
+                .output()
+                .await;
+
+            let Ok(output) = response else {
+                return (remote_id, None, Vec::<serde_json::Value>::new());
+            };
+
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let Some((body, status_code)) = split_curl_response_and_status(&stdout) else {
+                return (remote_id, None, Vec::<serde_json::Value>::new());
+            };
+
+            if status_code != StatusCode::OK.as_u16() {
+                return (remote_id, None, Vec::<serde_json::Value>::new());
+            }
+
+            let Ok(parsed) = serde_json::from_str::<serde_json::Value>(body.trim()) else {
+                return (remote_id, None, Vec::<serde_json::Value>::new());
+            };
+            let Some(items) = parsed.as_array() else {
+                return (remote_id, None, Vec::<serde_json::Value>::new());
+            };
+
+            let mut session_ids = Vec::<String>::new();
+            let mut mapped = Vec::<serde_json::Value>::with_capacity(items.len());
+            for item in items {
+                let mut session_value = item.clone();
+                if let Some(map) = session_value.as_object_mut() {
+                    if let Some(id) = map.get("id").and_then(|value| value.as_str()) {
+                        session_ids.push(id.to_string());
+                    }
+                    map.insert("source".to_string(), serde_json::json!("remote"));
+                    map.insert("remoteId".to_string(), serde_json::json!(remote_id));
+                    map.insert("remoteName".to_string(), serde_json::json!(remote_name));
+                    map.insert("remoteUrl".to_string(), serde_json::json!(remote_url));
+                }
+                mapped.push(session_value);
+            }
+
+            (remote_id, Some(session_ids), mapped)
+        });
+
+        let remote_results = futures::future::join_all(fetches).await;
+        for (remote_id, session_ids, mut remote_sessions) in remote_results {
+            if let Some(session_ids) = session_ids {
+                let mut registry = state.remote_registry.lock().await;
+                if let Some(remote) = registry.iter_mut().find(|remote| remote.id == remote_id) {
+                    remote.session_ids = session_ids;
+                }
+            }
+
+            all_sessions.append(&mut remote_sessions);
+        }
+    }
+
+    Json(all_sessions)
 }
 
 
@@ -7760,6 +7864,216 @@ fn signal_pid(pid: u32, signal: Option<&str>) {
         .arg(sig)
         .arg(pid.to_string())
         .status();
+}
+
+fn split_curl_response_and_status(output: &str) -> Option<(&str, u16)> {
+    let marker = "\n__VT_HTTP_STATUS__:";
+    let index = output.rfind(marker)?;
+    let body = &output[..index];
+    let status_text = output[index + marker.len()..].trim();
+    let status_code = status_text.parse::<u16>().ok()?;
+    Some((body, status_code))
+}
+
+fn parse_remote_json_body(body: &str, status_code: u16) -> Result<(u16, serde_json::Value), String> {
+    let body_trimmed = body.trim();
+    if body_trimmed.is_empty() {
+        return Ok((status_code, serde_json::json!({})));
+    }
+
+    match serde_json::from_str::<serde_json::Value>(body_trimmed) {
+        Ok(parsed) => Ok((status_code, parsed)),
+        Err(error) if status_code >= StatusCode::BAD_REQUEST.as_u16() => Ok((
+            status_code,
+            serde_json::json!({
+                "error": body_trimmed,
+                "details": format!("Remote response is not valid JSON: {error}"),
+            }),
+        )),
+        Err(error) => Err(format!("Invalid remote JSON response: {error}")),
+    }
+}
+
+async fn forward_remote_json_get(
+    remote_url: &str,
+    remote_token: &str,
+    endpoint_path: &str,
+) -> Result<(u16, serde_json::Value), String> {
+    let output = TokioCommand::new("curl")
+        .arg("-sS")
+        .arg("--max-time")
+        .arg("5")
+        .arg("-H")
+        .arg(format!("Authorization: Bearer {}", remote_token))
+        .arg("-w")
+        .arg("\n__VT_HTTP_STATUS__:%{http_code}")
+        .arg(format!(
+            "{}/{}",
+            remote_url.trim_end_matches('/'),
+            endpoint_path.trim_start_matches('/'),
+        ))
+        .output()
+        .await
+        .map_err(|error| format!("Failed to execute curl: {error}"))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let (body, status_code) = split_curl_response_and_status(&stdout)
+        .ok_or_else(|| "Invalid remote HTTP response".to_string())?;
+
+    parse_remote_json_body(body, status_code)
+}
+
+async fn forward_remote_json_post<T: Serialize>(
+    remote_url: &str,
+    remote_token: &str,
+    endpoint_path: &str,
+    payload: &T,
+) -> Result<(u16, serde_json::Value), String> {
+    let body = serde_json::to_string(payload)
+        .map_err(|error| format!("Failed to serialize request body: {error}"))?;
+
+    let output = TokioCommand::new("curl")
+        .arg("-sS")
+        .arg("--max-time")
+        .arg("5")
+        .arg("-X")
+        .arg("POST")
+        .arg("-H")
+        .arg("Content-Type: application/json")
+        .arg("-H")
+        .arg(format!("Authorization: Bearer {}", remote_token))
+        .arg("-d")
+        .arg(body)
+        .arg("-w")
+        .arg("\n__VT_HTTP_STATUS__:%{http_code}")
+        .arg(format!(
+            "{}/{}",
+            remote_url.trim_end_matches('/'),
+            endpoint_path.trim_start_matches('/'),
+        ))
+        .output()
+        .await
+        .map_err(|error| format!("Failed to execute curl: {error}"))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let (response_body, status_code) = split_curl_response_and_status(&stdout)
+        .ok_or_else(|| "Invalid remote HTTP response".to_string())?;
+
+    parse_remote_json_body(response_body, status_code)
+}
+
+async fn forward_remote_text_get(
+    remote_url: &str,
+    remote_token: &str,
+    endpoint_path: &str,
+) -> Result<(u16, String), String> {
+    let output = TokioCommand::new("curl")
+        .arg("-sS")
+        .arg("--max-time")
+        .arg("5")
+        .arg("-H")
+        .arg(format!("Authorization: Bearer {}", remote_token))
+        .arg("-w")
+        .arg("\n__VT_HTTP_STATUS__:%{http_code}")
+        .arg(format!(
+            "{}/{}",
+            remote_url.trim_end_matches('/'),
+            endpoint_path.trim_start_matches('/'),
+        ))
+        .output()
+        .await
+        .map_err(|error| format!("Failed to execute curl: {error}"))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let (body, status_code) = split_curl_response_and_status(&stdout)
+        .ok_or_else(|| "Invalid remote HTTP response".to_string())?;
+
+    Ok((status_code, body.to_string()))
+}
+
+async fn forward_remote_json_patch<T: Serialize>(
+    remote_url: &str,
+    remote_token: &str,
+    endpoint_path: &str,
+    payload: &T,
+) -> Result<(u16, serde_json::Value), String> {
+    let body = serde_json::to_string(payload)
+        .map_err(|error| format!("Failed to serialize request body: {error}"))?;
+
+    let output = TokioCommand::new("curl")
+        .arg("-sS")
+        .arg("--max-time")
+        .arg("5")
+        .arg("-X")
+        .arg("PATCH")
+        .arg("-H")
+        .arg("Content-Type: application/json")
+        .arg("-H")
+        .arg(format!("Authorization: Bearer {}", remote_token))
+        .arg("-d")
+        .arg(body)
+        .arg("-w")
+        .arg("\n__VT_HTTP_STATUS__:%{http_code}")
+        .arg(format!(
+            "{}/{}",
+            remote_url.trim_end_matches('/'),
+            endpoint_path.trim_start_matches('/'),
+        ))
+        .output()
+        .await
+        .map_err(|error| format!("Failed to execute curl: {error}"))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let (response_body, status_code) = split_curl_response_and_status(&stdout)
+        .ok_or_else(|| "Invalid remote HTTP response".to_string())?;
+
+    parse_remote_json_body(response_body, status_code)
+}
+
+async fn forward_remote_delete(
+    remote_url: &str,
+    remote_token: &str,
+    endpoint_path: &str,
+) -> Result<(u16, serde_json::Value), String> {
+    let output = TokioCommand::new("curl")
+        .arg("-sS")
+        .arg("--max-time")
+        .arg("10")
+        .arg("-X")
+        .arg("DELETE")
+        .arg("-H")
+        .arg(format!("Authorization: Bearer {}", remote_token))
+        .arg("-w")
+        .arg("\n__VT_HTTP_STATUS__:%{http_code}")
+        .arg(format!(
+            "{}/{}",
+            remote_url.trim_end_matches('/'),
+            endpoint_path.trim_start_matches('/'),
+        ))
+        .output()
+        .await
+        .map_err(|error| format!("Failed to execute curl: {error}"))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let (response_body, status_code) = split_curl_response_and_status(&stdout)
+        .ok_or_else(|| "Invalid remote HTTP response".to_string())?;
+
+    parse_remote_json_body(response_body, status_code)
+}
+
+async fn remove_remote_session_mapping(state: &AppState, remote_id: &str, session_id: &str) {
+    let mut registry = state.remote_registry.lock().await;
+    if let Some(entry) = registry.iter_mut().find(|entry| entry.id == remote_id) {
+        entry.session_ids.retain(|id| id != session_id);
+    }
+}
+
+async fn find_remote_by_session_id(state: &AppState, session_id: &str) -> Option<RemoteServerEntry> {
+    let registry = state.remote_registry.lock().await;
+    registry
+        .iter()
+        .find(|remote| remote.session_ids.iter().any(|id| id == session_id))
+        .cloned()
 }
 
 async fn read_pty_output_to_ws(
@@ -8514,6 +8828,53 @@ async fn api_create_session(
     State(state): State<AppState>,
     Json(payload): Json<SessionCreateRequest>,
 ) -> impl IntoResponse {
+    if state.config.is_hq_mode {
+        if let Some(remote_id) = payload.remote_id.as_ref() {
+            let remote_id_value = remote_id.clone();
+            let remote = {
+                let registry = state.remote_registry.lock().await;
+                registry.iter().find(|remote| remote.id == *remote_id).cloned()
+            };
+
+            let Some(remote) = remote else {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({ "error": "Remote server not found" })),
+                )
+                    .into_response();
+            };
+
+            match forward_remote_json_post(&remote.url, &remote.token, "/api/sessions", &payload).await {
+                Ok((status, body)) if status == StatusCode::OK.as_u16() => {
+                    if let Some(session_id) = body.get("sessionId").and_then(|value| value.as_str()) {
+                        let mut registry = state.remote_registry.lock().await;
+                        if let Some(entry) = registry.iter_mut().find(|entry| entry.id == remote_id_value) {
+                            if !entry.session_ids.iter().any(|id| id == session_id) {
+                                entry.session_ids.push(session_id.to_string());
+                            }
+                            entry.last_heartbeat = now_iso();
+                        }
+                    }
+                    return Json(body).into_response();
+                }
+                Ok((status, body)) => {
+                    return (
+                        StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+                        Json(body),
+                    )
+                        .into_response();
+                }
+                Err(_) => {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(serde_json::json!({ "error": "Failed to reach remote server" })),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    }
+
     if payload.command.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -8721,8 +9082,60 @@ async fn api_get_session(
     State(state): State<AppState>,
     AxumPath(session_id): AxumPath<String>,
 ) -> impl IntoResponse {
+    if state.config.is_hq_mode {
+        if let Some(remote) = find_remote_by_session_id(&state, &session_id).await {
+            match forward_remote_json_get(
+                &remote.url,
+                &remote.token,
+                &format!("/api/sessions/{session_id}"),
+            )
+            .await
+            {
+                Ok((status, body)) if status == StatusCode::OK.as_u16() => {
+                    return Json(body).into_response();
+                }
+                Ok((status, body)) => {
+                    return (
+                        StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+                        Json(body),
+                    )
+                        .into_response();
+                }
+                Err(_) => {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(serde_json::json!({ "error": "Failed to reach remote server" })),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    }
+
     let sessions = state.sessions.lock().await;
-    if let Some(session) = sessions.iter().find(|s| s.id == session_id).cloned() {
+    if let Some(mut session) = sessions.iter().find(|s| s.id == session_id).cloned() {
+        if session.git_repo_path.is_none() && !session.working_dir.trim().is_empty() {
+            let git_info = detect_git_info_for_directory(Path::new(&session.working_dir));
+            if session.git_repo_path.is_none() {
+                session.git_repo_path = git_info.git_repo_path;
+            }
+            if session.git_branch.is_none() {
+                session.git_branch = git_info.git_branch;
+            }
+            if session.git_ahead_count.is_none() {
+                session.git_ahead_count = git_info.git_ahead_count;
+            }
+            if session.git_behind_count.is_none() {
+                session.git_behind_count = git_info.git_behind_count;
+            }
+            if session.git_is_worktree.is_none() {
+                session.git_is_worktree = git_info.git_is_worktree;
+            }
+            if session.git_main_repo_path.is_none() {
+                session.git_main_repo_path = git_info.git_main_repo_path;
+            }
+        }
+
         let pid = {
             let processes = state.local_processes.lock().await;
             processes.get(&session_id).map(|p| p.pid)
@@ -8734,6 +9147,7 @@ async fn api_get_session(
                 "pid".to_string(),
                 pid.map_or(serde_json::Value::Null, |id| serde_json::json!(id)),
             );
+            map.insert("source".to_string(), serde_json::json!("local"));
         }
         return Json(value).into_response();
     }
@@ -8751,6 +9165,37 @@ async fn api_delete_session(
     State(state): State<AppState>,
     AxumPath(session_id): AxumPath<String>,
 ) -> impl IntoResponse {
+    if state.config.is_hq_mode {
+        if let Some(remote) = find_remote_by_session_id(&state, &session_id).await {
+            match forward_remote_delete(
+                &remote.url,
+                &remote.token,
+                &format!("/api/sessions/{session_id}"),
+            )
+            .await
+            {
+                Ok((status, body)) if status == StatusCode::OK.as_u16() => {
+                    remove_remote_session_mapping(&state, &remote.id, &session_id).await;
+                    return Json(body).into_response();
+                }
+                Ok((status, body)) => {
+                    return (
+                        StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+                        Json(body),
+                    )
+                        .into_response();
+                }
+                Err(_) => {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(serde_json::json!({ "error": "Failed to reach remote server" })),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    }
+
     let session = {
         let sessions = state.sessions.lock().await;
         sessions.iter().find(|s| s.id == session_id).cloned()
@@ -8790,7 +9235,8 @@ async fn api_delete_session(
             .into_response();
     }
 
-    let is_tmux_attachment = session.name.starts_with("tmux:") || session.command.join(" ").contains("tmux attach");
+    let is_tmux_attachment =
+        session.name.starts_with("tmux:") || session.command.join(" ").contains("tmux attach");
 
     let mut command_context: Option<(String, Option<i64>)> = None;
     if let Some(mut proc) = state.local_processes.lock().await.remove(&session_id) {
@@ -8816,15 +9262,15 @@ async fn api_delete_session(
     let mut removed = false;
     let mut waited_ms = 0u64;
     while waited_ms < 3000 {
-        {
-            let mut sessions = state.sessions.lock().await;
-            if let Some(position) = sessions.iter().position(|s| s.id == session_id && s.status == "exited") {
-                sessions.remove(position);
-                removed = true;
-            }
-        }
+        let is_exited = {
+            let sessions = state.sessions.lock().await;
+            sessions
+                .iter()
+                .any(|s| s.id == session_id && s.status == "exited")
+        };
 
-        if removed {
+        if is_exited {
+            removed = true;
             break;
         }
 
@@ -8833,11 +9279,6 @@ async fn api_delete_session(
     }
 
     if !removed {
-        let mut sessions = state.sessions.lock().await;
-        if let Some(position) = sessions.iter().position(|s| s.id == session_id) {
-            sessions.remove(position);
-        }
-
         let command_text = session.command.join(" ");
 
         emit_server_event(
@@ -8869,6 +9310,11 @@ async fn api_delete_session(
         }
     }
 
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.retain(|s| s.id != session_id);
+    }
+
     state.session_outputs.lock().await.remove(&session_id);
     state.session_subscriptions.lock().await.remove(&session_id);
     state.session_dimensions.lock().await.remove(&session_id);
@@ -8892,17 +9338,57 @@ async fn api_session_input(
     AxumPath(session_id): AxumPath<String>,
     Json(payload): Json<SessionInputRequest>,
 ) -> impl IntoResponse {
-    let sessions = state.sessions.lock().await;
-    let exists = sessions
-        .iter()
-        .any(|s| s.id == session_id && s.status == "running");
-    drop(sessions);
+    if state.config.is_hq_mode {
+        if let Some(remote) = find_remote_by_session_id(&state, &session_id).await {
+            match forward_remote_json_post(
+                &remote.url,
+                &remote.token,
+                &format!("/api/sessions/{session_id}/input"),
+                &payload,
+            )
+            .await
+            {
+                Ok((status, body)) if status == StatusCode::OK.as_u16() => {
+                    return Json(body).into_response();
+                }
+                Ok((status, body)) => {
+                    return (
+                        StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+                        Json(body),
+                    )
+                        .into_response();
+                }
+                Err(_) => {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(serde_json::json!({ "error": "Failed to reach remote server" })),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    }
 
-    if !exists {
+    let session = {
+        let sessions = state.sessions.lock().await;
+        sessions.iter().find(|s| s.id == session_id).cloned()
+    };
+
+    let Some(session) = session else {
         return (
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
                 error: "Session not found".to_string(),
+            }),
+        )
+            .into_response();
+    };
+
+    if session.status != "running" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "Session is not running".to_string(),
             }),
         )
             .into_response();
@@ -8920,33 +9406,11 @@ async fn api_session_input(
             .into_response();
     }
 
-    if let Some(text) = payload.text.as_ref() {
-        if text.is_empty() {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse {
-                    error: "Text must be a string".to_string(),
-                }),
-            )
-                .into_response();
-        }
-    }
-
-    if let Some(key) = payload.key.as_ref() {
-        if key.is_empty() {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse {
-                    error: "Key must be a string".to_string(),
-                }),
-            )
-                .into_response();
-        }
-    }
-
     let mut text_input_used = false;
+    let mut input_text_for_command_tracking: Option<String> = None;
     let emitted: Vec<u8> = if let Some(text) = payload.text {
         text_input_used = true;
+        input_text_for_command_tracking = Some(text.clone());
         text.into_bytes()
     } else if let Some(key) = payload.key {
         decode_input_key(key.as_bytes())
@@ -8961,7 +9425,9 @@ async fn api_session_input(
     }
 
     let command_from_input = if text_input_used {
-        extract_command_from_input(&emitted)
+        input_text_for_command_tracking
+            .as_deref()
+            .and_then(|text| extract_command_from_input(text.as_bytes()))
     } else {
         None
     };
@@ -9008,6 +9474,37 @@ async fn api_session_resize(
     AxumPath(session_id): AxumPath<String>,
     Json(payload): Json<SessionResizeRequest>,
 ) -> impl IntoResponse {
+    if state.config.is_hq_mode {
+        if let Some(remote) = find_remote_by_session_id(&state, &session_id).await {
+            match forward_remote_json_post(
+                &remote.url,
+                &remote.token,
+                &format!("/api/sessions/{session_id}/resize"),
+                &payload,
+            )
+            .await
+            {
+                Ok((status, body)) if status == StatusCode::OK.as_u16() => {
+                    return Json(body).into_response();
+                }
+                Ok((status, body)) => {
+                    return (
+                        StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+                        Json(body),
+                    )
+                        .into_response();
+                }
+                Err(_) => {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(serde_json::json!({ "error": "Failed to reach remote server" })),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    }
+
     let session = {
         let sessions = state.sessions.lock().await;
         sessions.iter().find(|s| s.id == session_id).cloned()
@@ -9111,6 +9608,37 @@ async fn api_cleanup_session(
     State(state): State<AppState>,
     AxumPath(session_id): AxumPath<String>,
 ) -> impl IntoResponse {
+    if state.config.is_hq_mode {
+        if let Some(remote) = find_remote_by_session_id(&state, &session_id).await {
+            match forward_remote_delete(
+                &remote.url,
+                &remote.token,
+                &format!("/api/sessions/{session_id}/cleanup"),
+            )
+            .await
+            {
+                Ok((status, body)) if status == StatusCode::OK.as_u16() => {
+                    remove_remote_session_mapping(&state, &remote.id, &session_id).await;
+                    return Json(body).into_response();
+                }
+                Ok((status, body)) => {
+                    return (
+                        StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+                        Json(body),
+                    )
+                        .into_response();
+                }
+                Err(_) => {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(serde_json::json!({ "error": "Failed to reach remote server" })),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    }
+
     state.session_outputs.lock().await.remove(&session_id);
     state.session_subscriptions.lock().await.remove(&session_id);
     state.session_dimensions.lock().await.remove(&session_id);
@@ -9172,85 +9700,167 @@ async fn api_cleanup_exited(State(state): State<AppState>) -> impl IntoResponse 
     let cleaned = before.saturating_sub(sessions.len());
     drop(sessions);
 
-    if !exited_ids.is_empty() {
-        for session_id in &exited_ids {
-            remove_session_info(session_id);
+    for session_id in &exited_ids {
+        remove_session_info(session_id);
+    }
+
+    let mut outputs = state.session_outputs.lock().await;
+    let mut subscriptions = state.session_subscriptions.lock().await;
+    let mut dimensions = state.session_dimensions.lock().await;
+
+    for (session_id, session_name, command) in exited_snapshot {
+        outputs.remove(&session_id);
+        subscriptions.remove(&session_id);
+        dimensions.remove(&session_id);
+        if let Some(mut proc) = state.local_processes.lock().await.remove(&session_id) {
+            let command_context = proc
+                .current_command
+                .take()
+                .map(|active_command| (active_command, proc.command_started_at_ms));
+
+            let _ = proc.writer.take();
+            if let Some(killer) = proc.killer.as_ref() {
+                let killer_clone = killer.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Ok(mut guard) = killer_clone.inner.lock() {
+                        let _ = guard.kill();
+                    }
+                })
+                .await;
+            } else {
+                signal_pid(proc.pid, Some("KILL"));
+            }
+
+            if let Some((active_command, started_at_ms)) = command_context {
+                emit_command_event_if_needed(&state, &session_id, &active_command, started_at_ms, 0)
+                    .await;
+            }
+        }
+        if let Some(handle) = state.git_watchers.lock().await.remove(&session_id) {
+            handle.abort();
         }
 
-        let mut outputs = state.session_outputs.lock().await;
-        let mut subscriptions = state.session_subscriptions.lock().await;
-        let mut dimensions = state.session_dimensions.lock().await;
+        emit_server_event(
+            &state,
+            None,
+            serde_json::json!({
+                "type": "session-exit",
+                "sessionId": session_id,
+                "sessionName": session_name,
+                "command": command,
+                "exitCode": 0,
+                "timestamp": now_iso(),
+            }),
+        )
+        .await;
 
-        for (session_id, session_name, command) in exited_snapshot {
-            outputs.remove(&session_id);
-            subscriptions.remove(&session_id);
-            dimensions.remove(&session_id);
-            if let Some(mut proc) = state.local_processes.lock().await.remove(&session_id) {
-                let command_context = proc
-                    .current_command
-                    .take()
-                    .map(|active_command| (active_command, proc.command_started_at_ms));
+        maybe_send_notification_event_to_mac(
+            &state,
+            "session-exit",
+            "Session Ended",
+            &session_name,
+            Some(&session_id),
+            Some(&session_name),
+        )
+        .await;
+    }
 
-                let _ = proc.writer.take();
-                if let Some(killer) = proc.killer.as_ref() {
-                    let killer_clone = killer.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        if let Ok(mut guard) = killer_clone.inner.lock() {
-                            let _ = guard.kill();
+    let mut total_cleaned = cleaned;
+    let mut remote_results = Vec::<serde_json::Value>::new();
+
+    if state.config.is_hq_mode {
+        let remotes_snapshot = state.remote_registry.lock().await.clone();
+        let remote_cleanup_results = futures::future::join_all(remotes_snapshot.into_iter().map(|remote| async move {
+            match forward_remote_json_post(&remote.url, &remote.token, "/api/cleanup-exited", &serde_json::json!({})).await {
+                Ok((status, body)) if status == StatusCode::OK.as_u16() => {
+                    let cleaned_session_ids = body
+                        .get("cleanedSessions")
+                        .and_then(|value| value.as_array())
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter_map(|value| value.as_str().map(|s| s.to_string()))
+                        .collect::<Vec<_>>();
+                    Ok((remote.id, remote.name, cleaned_session_ids))
+                }
+                Ok((status, _)) => Err((remote.name, format!("HTTP {status}"))),
+                Err(error) => Err((remote.name, error)),
+            }
+        })).await;
+
+        for result in remote_cleanup_results {
+            match result {
+                Ok((remote_id, remote_name, cleaned_session_ids)) => {
+                    total_cleaned += cleaned_session_ids.len();
+                    {
+                        let mut registry = state.remote_registry.lock().await;
+                        if let Some(entry) = registry.iter_mut().find(|entry| entry.id == remote_id) {
+                            entry.session_ids.retain(|id| !cleaned_session_ids.iter().any(|cleaned_id| cleaned_id == id));
                         }
-                    })
-                    .await;
-                } else {
-                    signal_pid(proc.pid, Some("KILL"));
+                    }
+                    remote_results.push(serde_json::json!({
+                        "remoteName": remote_name,
+                        "cleaned": cleaned_session_ids.len(),
+                    }));
                 }
-
-                if let Some((active_command, started_at_ms)) = command_context {
-                    emit_command_event_if_needed(&state, &session_id, &active_command, started_at_ms, 0)
-                        .await;
+                Err((remote_name, error)) => {
+                    remote_results.push(serde_json::json!({
+                        "remoteName": remote_name,
+                        "cleaned": 0,
+                        "error": error,
+                    }));
                 }
             }
-            if let Some(handle) = state.git_watchers.lock().await.remove(&session_id) {
-                handle.abort();
-            }
-
-            emit_server_event(
-                &state,
-                None,
-                serde_json::json!({
-                    "type": "session-exit",
-                    "sessionId": session_id,
-                    "sessionName": session_name,
-                    "command": command,
-                    "exitCode": 0,
-                    "timestamp": now_iso(),
-                }),
-            )
-            .await;
-
-            maybe_send_notification_event_to_mac(
-                &state,
-                "session-exit",
-                "Session Ended",
-                &session_name,
-                Some(&session_id),
-                Some(&session_name),
-            )
-            .await;
         }
     }
 
     Json(serde_json::json!({
         "success": true,
-        "message": format!("{} exited sessions cleaned up across all servers", cleaned),
+        "message": format!("{} exited sessions cleaned up across all servers", total_cleaned),
         "localCleaned": cleaned,
-        "remoteResults": []
+        "remoteResults": remote_results,
     }))
 }
 
 async fn api_session_text(
     State(state): State<AppState>,
     AxumPath(session_id): AxumPath<String>,
+    query: Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
+    let include_styles = query.0.contains_key("styles");
+
+    if state.config.is_hq_mode {
+        if let Some(remote) = find_remote_by_session_id(&state, &session_id).await {
+            let endpoint = if include_styles {
+                format!("/api/sessions/{session_id}/text?styles=")
+            } else {
+                format!("/api/sessions/{session_id}/text")
+            };
+
+            match forward_remote_text_get(&remote.url, &remote.token, &endpoint).await {
+                Ok((status, body)) if status == StatusCode::OK.as_u16() => {
+                    return ([(header::CONTENT_TYPE, "text/plain")], body).into_response();
+                }
+                Ok((status, body)) => {
+                    let body_json = serde_json::from_str::<serde_json::Value>(body.trim())
+                        .unwrap_or_else(|_| serde_json::json!({ "error": body.trim() }));
+                    return (
+                        StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+                        Json(body_json),
+                    )
+                        .into_response();
+                }
+                Err(_) => {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(serde_json::json!({ "error": "Failed to reach remote server" })),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    }
+
     let sessions = state.sessions.lock().await;
     let exists = sessions.iter().any(|s| s.id == session_id);
     drop(sessions);
@@ -9279,6 +9889,37 @@ async fn api_patch_session(
     AxumPath(session_id): AxumPath<String>,
     Json(payload): Json<SessionPatchRequest>,
 ) -> impl IntoResponse {
+    if state.config.is_hq_mode {
+        if let Some(remote) = find_remote_by_session_id(&state, &session_id).await {
+            match forward_remote_json_patch(
+                &remote.url,
+                &remote.token,
+                &format!("/api/sessions/{session_id}"),
+                &payload,
+            )
+            .await
+            {
+                Ok((status, body)) if status == StatusCode::OK.as_u16() => {
+                    return Json(body).into_response();
+                }
+                Ok((status, body)) => {
+                    return (
+                        StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+                        Json(body),
+                    )
+                        .into_response();
+                }
+                Err(_) => {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(serde_json::json!({ "error": "Failed to reach remote server" })),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    }
+
     let Some(name) = payload.name else {
         return (
             StatusCode::BAD_REQUEST,
@@ -9347,6 +9988,37 @@ async fn api_reset_session_size(
     State(state): State<AppState>,
     AxumPath(session_id): AxumPath<String>,
 ) -> impl IntoResponse {
+    if state.config.is_hq_mode {
+        if let Some(remote) = find_remote_by_session_id(&state, &session_id).await {
+            match forward_remote_json_post(
+                &remote.url,
+                &remote.token,
+                &format!("/api/sessions/{session_id}/reset-size"),
+                &serde_json::json!({}),
+            )
+            .await
+            {
+                Ok((status, body)) if status == StatusCode::OK.as_u16() => {
+                    return Json(body).into_response();
+                }
+                Ok((status, body)) => {
+                    return (
+                        StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+                        Json(body),
+                    )
+                        .into_response();
+                }
+                Err(_) => {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(serde_json::json!({ "error": "Failed to reach remote server" })),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    }
+
     let session = {
         let sessions = state.sessions.lock().await;
         sessions.iter().find(|s| s.id == session_id).cloned()
@@ -9418,6 +10090,36 @@ async fn api_session_git_status(
     State(state): State<AppState>,
     AxumPath(session_id): AxumPath<String>,
 ) -> impl IntoResponse {
+    if state.config.is_hq_mode {
+        if let Some(remote) = find_remote_by_session_id(&state, &session_id).await {
+            match forward_remote_json_get(
+                &remote.url,
+                &remote.token,
+                &format!("/api/sessions/{session_id}/git-status"),
+            )
+            .await
+            {
+                Ok((status, body)) if status == StatusCode::OK.as_u16() => {
+                    return Json(body).into_response();
+                }
+                Ok((status, body)) => {
+                    return (
+                        StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+                        Json(body),
+                    )
+                        .into_response();
+                }
+                Err(_) => {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(serde_json::json!({ "error": "Failed to reach remote server" })),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    }
+
     let session = {
         let sessions = state.sessions.lock().await;
         sessions.iter().find(|s| s.id == session_id).cloned()
